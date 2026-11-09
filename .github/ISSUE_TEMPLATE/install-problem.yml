@@ -1,0 +1,82 @@
+name: Install problem
+description: The SDK or the plugin would not install, or would not start after installing.
+labels: ["install"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        If the SDK did not install, `plurai diagnose` cannot run, so paste the pieces it would have printed. Look over
+        every paste first: remove a password from a package index url, and never paste `~/.plurai/credentials.json` or a token.
+  - type: textarea
+    id: install-command
+    attributes:
+      label: The install command you ran
+      description: The exact command, with any index credentials removed.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: install-output
+    attributes:
+      label: Output of the install command
+      description: Re-run it with `-v` and paste the last 50 lines or more.
+      render: text
+    validations:
+      required: true
+  - type: input
+    id: python
+    attributes:
+      label: Python version
+      description: Output of `python --version`.
+    validations:
+      required: true
+  - type: input
+    id: pip
+    attributes:
+      label: Installer version
+      description: Output of `pip --version`, or `uv --version`.
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system and CPU
+      description: Output of `uname -a` on macOS or Linux, `ver` on Windows.
+    validations:
+      required: true
+  - type: dropdown
+    id: harness
+    attributes:
+      label: Harness
+      options:
+        - Claude Code
+        - Codex
+        - GitHub Copilot
+        - Other
+        - Not using the plugin
+    validations:
+      required: true
+  - type: input
+    id: plugin-version
+    attributes:
+      label: Plugin version
+      description: The version of the Plurai simulation plugin, or "not installed".
+    validations:
+      required: true
+  - type: input
+    id: sdk-version
+    attributes:
+      label: SDK version
+      description: Output of `plurai --version` if the SDK installed but fails later; otherwise "not installed".
+    validations:
+      required: true
+  - type: input
+    id: command-run-id
+    attributes:
+      label: Command run id
+      description: The id a failing command printed, or the `Command run id` line of `plurai diagnose` if it runs. Leave empty if there is none.
+  - type: textarea
+    id: bundle
+    attributes:
+      label: Output of `plurai diagnose`, if it runs
+      render: text

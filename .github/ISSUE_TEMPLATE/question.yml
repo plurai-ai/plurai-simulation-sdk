@@ -1,0 +1,55 @@
+name: Question
+description: Ask how something works or whether it can do what you need.
+labels: ["question"]
+body:
+  - type: textarea
+    id: question
+    attributes:
+      label: What are you trying to do?
+      description: Describe the goal and what you tried. Remove anything private first.
+    validations:
+      required: true
+  - type: input
+    id: sdk-version
+    attributes:
+      label: SDK version
+      description: Output of `plurai --version`.
+    validations:
+      required: true
+  - type: input
+    id: plugin-version
+    attributes:
+      label: Plugin version
+      description: The version of the Plurai simulation plugin, or "not used".
+    validations:
+      required: true
+  - type: dropdown
+    id: harness
+    attributes:
+      label: Harness
+      options:
+        - Claude Code
+        - Codex
+        - GitHub Copilot
+        - Other
+        - Not using the plugin
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+    validations:
+      required: true
+  - type: input
+    id: python
+    attributes:
+      label: Python version
+      description: Output of `python --version`.
+    validations:
+      required: true
+  - type: input
+    id: command-run-id
+    attributes:
+      label: Command run id
+      description: If the question is about a command that ran, its id from `plurai diagnose`. Leave empty otherwise.

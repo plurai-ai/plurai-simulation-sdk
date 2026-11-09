@@ -1,0 +1,324 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "plurai-simulation-sdk"
+version = "1.0.0"
+description = "Simulate conversations against your AI agent and score it on your policies."
+readme = "README.md"
+license = {text = "Proprietary"}
+# The floor is 3.12, the lowest version every tested surface runs on: the arize and
+# braintrust sink extras, the mock engine's own floor, and `sys.monitoring` (PEP 669) in
+# the entry witness. The CI matrix tests 3.12 and 3.13; the classifiers below list the same
+# versions and tests/test_python_floor.py keeps the surfaces in agreement.
+requires-python = ">=3.12"
+classifiers = [
+    "License :: Other/Proprietary License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+dependencies = [
+    # The mock engine is pinned to one release: the SDK re-exports its surface and a generated mock
+    # environment imports it, so both must run the same engine. Bump deliberately with the SDK.
+    "plurai-mockenv==1.5.6",
+    # The floor is the first langchain-core with no known advisory: every lower release, the 0.3 line included, has one.
+    # The SDK installs into the agent's environment, so this is also the lowest LangChain an agent may run.
+    "langchain-core>=1.3.3",
+    # langsmith comes in through langchain-core, whose own floor admits langsmith releases with known advisories. The
+    # floor is the first langsmith with none.
+    "langsmith>=0.8.18",
+    # The REST client for the Plurai backend.
+    "httpx>=0.27",
+    # The OAuth client of `plurai login`: PKCE, the token request and revocation. Pinned exactly, because it handles the
+    # sign-in; a bump follows its advisory feed.
+    "authlib==1.9.5",
+    # The HTTP package Authlib's client runs on when it is installed. Named here so the OAuth client never falls back to
+    # `httpx` and its exceptions are the ones oauth_client catches. The rest of the SDK stays on `httpx`.
+    "httpx2>=2.13",
+    # Retry and back-off in plurai.orchestrator._retry; the floor matches langchain-core's transitive constraint.
+    "tenacity>=8.1.0,!=8.4.0",
+    "pydantic>=2.5",
+    # Typed observability settings with nested per-sink env config. A base dependency so `import plurai` needs no sink extra.
+    # The excluded releases (2.12.0 to 2.14.1) carry a known advisory; the releases below and above them do not.
+    "pydantic-settings>=2.0,!=2.12.*,!=2.13.*,!=2.14.0,!=2.14.1",
+    # Settings autoload the nearest .env in the runner process, through pydantic-settings (see plurai/_dotenv.py).
+    # The floor is the first release with no known advisory.
+    "python-dotenv>=1.2.2",
+    "PyYAML>=6.0",  # ingest posture resolution: plurai.ingest.posture reads plurai.config.yaml
+]
+
+[project.scripts]
+# Client-side end-to-end runner: drives simulate.py against the Plurai backend and writes the per-scenario artifacts.
+plurai-run-simulation = "plurai.run_simulation:main"
+# Ingestion CLI: `plurai ingest-{corpus,traces,doc-examples,bundle}` extracts, anonymizes (fail-closed), uploads and prints the lease-ref manifest.
+plurai = "plurai.ingest.cli:main"
+# Runs the executable scan contract on the machine that holds the customer's sources, with the same subcommands and flags as the backend's scan-contract command.
+plurai-scan-contract = "plurai.scan_contract_cli:main"
+
+[project.optional-dependencies]
+# Observability sinks. Sink API keys are supplied client-side, one sink is active at a time and every sink operation is best-effort, so a missing
+# package or a sink failure never breaks a run. Each extra is opt-in and the sink lazy-imports its package.
+#
+# Client-side LangSmith feedback posting in plurai.Orchestrator; without it feedback is skipped. The floor is the first release
+# with no known advisory.
+langsmith = ["langsmith>=0.8.18"]
+# Langfuse sink. >=4 provides the `Langfuse, propagate_attributes` API and the v4 `api.scores_v3` / `api.observations` lookups that
+# `plurai correct-scores` uses. <5 is a ceiling: v5 removes the v1 trace API (the self-hosted Langfuse v3 fallback of the trace export) and renames
+# `api.scores_v3`, which the trace export and score correction read scores through. The sink emits spans and scores through the Langfuse client,
+# so `langchain` is not a dependency of this extra.
+langfuse = ["langfuse>=4,<5"]
+# Arize AX sink: tracing through arize-otel and the OpenInference span grammar, dataset sync and evals through the arize v8 client (which pulls pandas).
+arize = [
+    "arize>=8.0.0",
+    "arize-otel>=0.13.0",
+    "openinference-semantic-conventions>=0.1.14",
+]
+# Braintrust sink.
+braintrust = ["braintrust>=0.24.0"]
+# Client-side corpus extraction (`plurai.rag_extract`, `plurai ingest-corpus`). Per-source drivers layer
+# on top as the `extract-<driver>` extras below.
+extract = ["plurai-extract==1.0.2"]
+# One extra per source driver of plurai-extract, pinned to the same release as `extract`: `plurai-simulation-sdk[extract-pdf]`.
+extract-pdf = ["plurai-extract[pdf]==1.0.2"]
+extract-http = ["plurai-extract[http]==1.0.2"]
+extract-vertex = ["plurai-extract[vertex]==1.0.2"]
+extract-bigquery = ["plurai-extract[bigquery]==1.0.2"]
+extract-redshift = ["plurai-extract[redshift]==1.0.2"]
+extract-azure-sql = ["plurai-extract[azure-sql]==1.0.2"]
+extract-databricks = ["plurai-extract[databricks]==1.0.2"]
+extract-snowflake = ["plurai-extract[snowflake]==1.0.2"]
+extract-bedrock = ["plurai-extract[bedrock]==1.0.2"]
+# Document readers the generated harness (simulate.py) previews agent output with. Bare `markitdown` ships no format readers (without `mammoth`
+# every .docx reads as unmeasurable); the extras are the readers: mammoth, python-pptx, openpyxl, pdfminer.six. `plurai.file_rows` imports
+# openpyxl and python-pptx directly.
+readers = ["markitdown[docx,pptx,xlsx,pdf]>=0.1.0"]
+# Client-side anonymization (plurai.ingest.anonymize), required only when an env sets `anonymize: true` in plurai.config.yaml. Presidio detects
+# PII with spaCy NER and the SDK replaces it with a keyed one-way hash. Ingestion is fail-closed: an opted-in env refuses to run without this
+# extra. The spaCy English model is not a PyPI dependency; install one of en_core_web_{lg,md,sm}, e.g. `python -m spacy download en_core_web_lg`.
+anonymize = [
+    "presidio-analyzer>=2.2",
+    # The floor is the first release that requires cryptography>=50, the first cryptography with no known advisory. Lower
+    # releases cap cryptography below 49 or use pycryptodome, and both resolve to versions with known advisories.
+    "presidio-anonymizer>=2.2.365",
+    # preshed 3.0.14 makes `spacy.load` raise OverflowError with en_core_web_sm.
+    "preshed<3.0.14",
+]
+# Binary-asset anonymization (plurai.ingest.anonymize), required only for envs whose posture is `anonymized`. It extends `anonymize` to images and
+# PDFs: images lose their metadata and are OCR-redacted, PDFs are rasterized per page, redacted and rebuilt as image-only PDFs. It needs two
+# system binaries that pip cannot install, Tesseract and Poppler (`pdftoppm`). Ingestion is fail-closed: a missing extra or binary raises and no
+# unscrubbed bytes leave the machine.
+anonymize-binary = [
+    "plurai-simulation-sdk[anonymize]",
+    # Pillow 13.0.0 is the first Pillow with no known advisory, and presidio-image-redactor 0.0.62 is the first release that
+    # accepts it.
+    "presidio-image-redactor>=0.0.62",
+    "pdf2image>=1.16",
+    "Pillow>=13.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/plurai-ai/plurai-simulation-sdk"
+Repository = "https://github.com/plurai-ai/plurai-simulation-sdk"
+Issues = "https://github.com/plurai-ai/plurai-simulation-sdk/issues"
+Changelog = "https://github.com/plurai-ai/plurai-simulation-sdk/blob/main/CHANGELOG.md"
+
+# For local co-development against an editable plurai-mockenv checkout, add an UNCOMMITTED override:
+#   [tool.uv.sources]
+#   plurai-mockenv = { path = "../plurai-mockenv", editable = true }
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["plurai*"]
+
+# Ship the PEP 561 ``py.typed`` marker so downstream type checkers consume plurai's inline annotations.
+[tool.setuptools.package-data]
+# Non-Python files that are runtime, not samples. The Node shims in _mocking/node are loaded by path out of the installed
+# package (`node --require .../code_hook.cjs`, `node --import .../fetch_shadow.mjs`), and plurai.egress_guard puts
+# _egress_site on a Python subprocess's PYTHONPATH; plurai.login._pages reads the browser pages of `plurai login` from
+# login/pages. Globs, so a new shim or page cannot ship unshipped.
+plurai = ["py.typed", "_mocking/node/*.cjs", "_mocking/node/*.mjs", "_egress_site/sitecustomize.py", "login/pages/*.html"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    # plurai.MockToolNode targets LangGraph; the mock-routing tests and the example smoke build a real StateGraph. Dev-only.
+    "langgraph>=0.2",
+    # plurai.confine edits a claude_agent_sdk ClaudeAgentOptions; its tests build the real one
+    # (a stub cannot miss a field) and the real CLI argv. The agent's own venv supplies it at runtime.
+    "claude-agent-sdk>=0.1.0",
+    # The sink packages, mirroring the extras, so local runs can exercise the opt-in live sink tests (gated on <SINK>_API_KEY). Not runtime dependencies.
+    "langsmith>=0.8.18",
+    "langfuse>=4,<5",
+    "langchain>=0.2.0",
+    "arize>=8.0.0",
+    "arize-otel>=0.13.0",
+    "openinference-semantic-conventions>=0.1.14",
+    "braintrust>=0.24.0",
+    # Anonymization stack mirroring the `anonymize` extra, with a small spaCy model as a direct wheel URL (models do not resolve by name). The
+    # Presidio tests importorskip.
+    "presidio-analyzer>=2.2",
+    "presidio-anonymizer>=2.2.365",
+    "en-core-web-sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl",
+    # Binary-asset stack mirroring `anonymize-binary`. It needs the Tesseract and Poppler system binaries (Linux: `apt-get install tesseract-ocr
+    # poppler-utils`; macOS: `brew install tesseract poppler`); the OCR tests skip when either is absent. reportlab and pypdf build and inspect PDF fixtures.
+    "presidio-image-redactor>=0.0.62",
+    "pdf2image>=1.16",
+    "Pillow>=13.0.0",
+    "reportlab>=4.0",
+    "pypdf>=4.0",
+    # ruff runs through `uvx ruff`; pyright is pinned because its diagnostics can change between minor versions.
+    "pyright==1.1.407",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+# Integration tests need a local Plurai backend checkout and are opt-in: `uv run --no-sync pytest -m integration`.
+addopts = '-m "not integration"'
+markers = [
+    "integration: requires a local backend checkout; run with -m integration",
+    "windows: needs a Windows host (skipped elsewhere)",
+]
+
+# Lint and format: line length 160, single quotes, Python 3.12.
+[tool.ruff]
+indent-width = 4
+line-length = 160
+target-version = "py312"
+src = ["plurai", "tests"]
+
+[tool.ruff.format]
+quote-style = "single"
+
+[tool.ruff.lint]
+select = [
+    "E", "W", "F", "N8", "UP", "YTT", "ANN0", "ASYNC", "S", "BLE", "FBT", "B", "C4", "DTZ", "INP", "PIE", "PT", "Q", "RET", "SLF", "SLOT",
+    "LOG", "SIM", "TID", "PTH", "TD", "ERA",
+    "PL",
+    "FAST",
+]
+ignore = [
+    "S311", # While this is a good rule, 95% of the time random is not used for crypto
+    "PLR2004", # This rule is a bit overzealous
+    "PLR6301", # Methods that do not use self are common here (protocol implementations, overridable hooks)
+    "PLR0911", # Many return statements are clearer than nesting in dispatch-style functions
+    "PLR0915", # Too many statements - acceptable for complex functions
+    "PLW0603", # Global statement is acceptable for settings cache
+    "BLE001", # Blind exceptions are acceptable with fallback logic
+    "PLR0912", # Too many branches - acceptable for complex interactive functions
+    "FBT001", # Boolean positional args - acceptable in internal APIs
+    "FBT002", # Boolean default positional args - acceptable in internal APIs
+    "PLC0415", # Late imports - acceptable for avoiding circular imports (the sink lazy-imports)
+    "ANN001", # Missing argument annotations - not required yet
+    "ANN003", # Missing **kwargs annotations - not required yet
+    "DTZ005", # datetime.now() without timezone - acceptable for timestamps
+    "SIM108", # Ternary operator - sometimes if-else is clearer
+    "SIM102", # Nested if statements - sometimes clearer than combined
+    "PTH123", # Path.open() - open() is fine
+    "TD002", # TODO author - not required for simple TODOs
+    "TD003", # TODO issue link - not required for simple TODOs
+    "B008", # Function call in arg defaults - the FastAPI Depends / typer pattern
+    "N806", # Non-lowercase var in function - all hits are function-scoped lazy imports of SDK classes
+    "N803", # Non-lowercase arg name - same lazy-imported SDK classes threaded in as injected params
+    "PLR0913", # Too many arguments - acceptable for node/session factories (already ignored in tests)
+    "FBT003", # Boolean positional value in call - the typer.Option(False, ...) default pattern
+    # Best-effort patterns that are deliberate; real-bug cases stay visible with a per-line `# noqa` at the call site.
+    "SIM105", # try/except/pass best-effort swallow - the sink/subprocess "never break a run" invariant (sibling of the already-ignored BLE001); contextlib.suppress can't wrap the await-then-swallow forms
+    "S110", # same best-effort try/except/pass swallow - paired with BLE001
+    "ASYNC109", # async helper exposing a `timeout=` param - deliberate one-shot dispatch API in _subprocess.py
+    "ANN002", # Missing *args annotations - not required yet, like ANN001 and ANN003
+    "SLF001", # Private member access - the in-process mock runtime crosses its OWN private boundary (already ignored in tests/)
+    "PTH207", # glob over Path.glob - string-based glob is used where patterns arrive as text (like PTH123)
+    "PTH118", # os.path.join over Path / - string paths are used where the host environment hands them in as text
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = [
+    "S101", # Assert is expected in tests
+    "S105", # Hardcoded passwords in tests are acceptable
+    "S106", # Hardcoded passwords in tests are acceptable
+    "ANN001", # Missing type annotations acceptable in tests
+    "ANN002", # Missing type annotations for *args acceptable in tests
+    "ANN201", # Missing return type acceptable in tests
+    "PLR0913", # Too many arguments acceptable in tests
+    "PLR0917", # Too many positional arguments - sibling of PLR0913, acceptable in tests
+    "PLR0915", # Too many statements acceptable in tests
+    "PTH123", # open() acceptable in tests
+    "SLF001", # Private member access acceptable in tests
+    "PT017", # Assert on exception acceptable in tests
+    "PT011", # pytest.raises without match parameter acceptable in tests
+    "S108", # Hardcoded /tmp paths are fine in tests
+    "S603", # subprocess calls are fine in tests
+    "S607", # partial executable paths (uvx/ruff on PATH) are fine in tests
+    "PT018", # Composite asserts are fine in tests
+    "B017", # pytest.raises(Exception) is fine in tests
+    "INP001", # Test dirs intentionally have no __init__.py
+    "SIM117", # Nested with-statements are fine in tests
+    "C408", # dict() over literal is fine in tests
+    "N812", # Lowercase-imported-as-non-lowercase acceptable in tests
+    "N814", # CamelCase-imported-as-constant acceptable in tests
+    "N818", # Exception naming acceptable in tests
+    "N802", # Function name casing acceptable in tests
+    "E702", # Multiple statements on one line acceptable in tests
+    "ASYNC220", # Spawning processes in async tests is fine
+    "PT013", # pytest import style acceptable in tests
+    "B007", # Unused loop var acceptable in tests
+    "ERA001", # Commented-out code acceptable in tests
+    "PT019", # Fixture-without-value injected as param - the _seeded_set_metadata side-effect fixture pattern
+    "PT006", # parametrize names as a comma-string (not a tuple) - the conventional terse form
+    "PLW0108", # "unnecessary" lambda - kept for call-site readability in a test double
+    "RET503", # Implicit return - acceptable in test helper branches
+]
+"examples/**/*.py" = [
+    "INP001", # Example scripts are not a package
+    "S101", # asserts are fine in example scripts
+    "T201", # print() is fine in example scripts
+    "E501", # Long lines acceptable in example scripts
+    "E402", # Example scripts interleave imports with narrative setup blocks
+]
+"scripts/**/*.py" = [
+    "INP001", # Wire regen tooling (preprocess + header stamp) is standalone, not a package
+    "T201", # print() is the regen scripts' status output
+    "S603", # subprocess in tooling is fine (no untrusted input)
+]
+# The generated wire models follow the contract's field names and long descriptions, not this style.
+"plurai/orchestrator/models.py" = [
+    "N815", # mixedCase wire field names are dictated by the contract, not chosen here
+    "E501", # long Field titles/descriptions live on single generated lines
+]
+
+[tool.ruff.lint.flake8-quotes]
+inline-quotes = "single"
+multiline-quotes = "double"
+
+# Pyright runs in basic mode over the whole package (`py.typed` ships). The four rules below are warnings, not errors, so existing
+# diagnostics stay visible without blocking the gate.
+[tool.pyright]
+include = ["plurai"]
+exclude = ["**/__pycache__", "**/*_generated.py"]
+typeCheckingMode = "basic"
+pythonVersion = "3.12"
+# A sibling editable install of plurai-mockenv (PEP 660 finder hook) is invisible to pyright, so the
+# sibling source is on the path too. Harmless where plurai-mockenv is a normally installed package.
+extraPaths = ["../plurai-mockenv"]
+reportArgumentType = "warning"
+reportOptionalMemberAccess = "warning"
+reportAttributeAccessIssue = "warning"
+reportOptionalCall = "warning"
+
+# plurai.rag_extract lazy-imports the optional `plurai-extract` (the `extract` extra). The
+# type-check environment may not carry it, so its imports are unresolved by design — silence
+# reportMissingImports for that one module only.
+[[tool.pyright.executionEnvironments]]
+root = "plurai/rag_extract.py"
+reportMissingImports = "none"
+
+# plurai.ingest.anonymize lazy-imports the optional `anonymize` extra (presidio-*,
+# spaCy) behind fail-closed guards. That stack is absent from the base/CI env by
+# design (ingestion refuses to run without it), so its imports are unresolved —
+# silence reportMissingImports for that one module only.
+[[tool.pyright.executionEnvironments]]
+root = "plurai/ingest/anonymize.py"
+reportMissingImports = "none"

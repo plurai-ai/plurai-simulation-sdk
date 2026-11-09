@@ -1,0 +1,60 @@
+# plurai.config.yaml for the SDK's own example benches.
+#
+# THIS FILE'S SCOPE IS THE WHOLE DIRECTORY, not one bench. Every workspace declaration is read at
+# two rungs — the harness's own directory and the repo root above it — so this config answers for
+# BOTH `simulate_smoke.py` and `simulate_own_state.py`, and a sub-directory would not isolate them
+# (the parent rung still reaches here). Two consequences, both deliberate:
+#
+#   * Everything below is written for `simulate_smoke.py`, and `simulate_own_state.py` inherits it
+#     harmlessly: `may_open` only fires when the server sends no first message, and the declared
+#     input kinds gate the parts the CHILD projects, not anything that bench reads.
+#   * There is NO `world_state:` key here ON PURPOSE. `simulate_own_state.py` is the bench for an
+#     agent whose world the mock does NOT own, and a real workspace of that shape declares
+#     `world_state: {owner: external}` beside its harness (see that file's docstring). Declaring it
+#     HERE would also declare it for `simulate_smoke.py` — which is mock-owned and exports no
+#     `reset()` — and `plurai-run-simulation` would refuse to start the smoke example. If a later
+#     bench needs the key, it needs its own directory OUTSIDE `examples/`, not a key added here.
+#
+# The bench declares its tools INLINE — `@plurai.mock(..., descriptor={...})` in simulate_smoke.py,
+# exported to plurai_mocks.yaml — so this file carries only what a config is the single source of
+# truth for: the env's identity, and the declarations the runner dispatches on.
+#
+# It exists so `agent.io` below has a bench that PROVES it end to end. The declaration is read at
+# the two rungs every workspace declaration is read at (this directory, and the repo root above
+# it), by both halves of the run: plurai/_subprocess.py gates the empty opener on it, and
+# plurai/child.py projects the turn's content parts against it.
+
+workspace: plurai
+project: sdk-smoke-bench
+
+agent:
+  framework: langgraph
+  graph_variable: app
+  state_class: AgentState
+  checkpointer: memory
+  entry_point: fetch_context
+
+# --- The turn-input surface ---
+# What may ride the user's own message, and whether the agent may open the conversation.
+#
+#   input:     the OpenAI content-part kinds `invoke_agent` can read off `payload['messages']`.
+#              This bench reads `text` and `file` (see `_read_user_turn` in simulate_smoke.py) and
+#              deliberately does NOT declare `image_url` — a kind plurai knows how to carry but
+#              this harness cannot read is exactly the case the child must refuse rather than
+#              drop, and this bench is the producer that proves it.
+#   may_open:  true, so the child may call `invoke_agent({'messages': []})` and the agent greets
+#              first — the IVR / outbound / kiosk shape. A harness that declares this MUST handle
+#              an empty message list; `llm_node`'s opener branch is what handling it looks like.
+#   opens:     (not declared here) `always` when production's host opens EVERY conversation, even
+#              one whose scenario authors a first_talk: turn 0 is the agent's opener and first_talk
+#              is turn 1. Implies `may_open: true`; omitted, a first_talk is turn 0.
+#
+# Omitting the whole block is the undeclared default: `[text]`, and no empty opener.
+agent.io:
+  input: [text, file]
+  may_open: true
+
+# The variables the agent needs from the launching environment. The agent under test does not inherit the rest of it:
+# it starts with an allowlist, the names listed here, and the run's PLURAI_URL / PLURAI_TOKEN.
+# `simulate_own_state.py` keeps its file-backed store where this variable points.
+agent.env: [OWN_STATE_STORE]

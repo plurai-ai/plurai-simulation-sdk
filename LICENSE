@@ -1,0 +1,159 @@
+PLURAI SIMULATION SDK LICENSE
+
+Copyright (c) 2026 Plurai Inc. All rights reserved.
+
+This is proprietary software. It is not open source. This license is a legal
+agreement between you and Plurai Inc ("Plurai"). By installing,
+copying or using the Software you accept it. If you accept on behalf of an
+organization, you confirm that you have authority to bind it, and "you" means
+that organization. If you do not accept it, do not install or use the Software.
+
+1. DEFINITIONS
+
+"Software" means the Plurai Simulation SDK (the plurai-simulation-sdk package) in
+any form, including its code, command-line tools, prompts, schemas, examples and
+documentation, and any update to them.
+
+"Service" means the hosted Plurai simulation backend, used under an active
+Plurai account and the Plurai Terms of Service (the "Terms").
+
+"Output" means the files the Software generates for you from your own agent and
+inputs, such as simulation results, world-state snapshots, traces and reports.
+Output does not include the Software.
+
+2. NO RIGHTS EXCEPT THOSE GRANTED
+
+The Software is licensed, not sold. Plurai and its licensors keep all right,
+title and interest in it. Everything not expressly granted here is reserved,
+and no right is granted by implication, estoppel or otherwise. The fact that the
+Software can be read in a public repository, on a package index, in a package cache
+or inside an AI assistant's context gives you no right to use it.
+
+3. LIMITED LICENSE
+
+While you hold an active Plurai account and comply with this license and the
+Terms, Plurai grants you a limited, revocable, non-exclusive, non-transferable,
+non-sublicensable license to install and run unmodified copies of the Software:
+
+  (a) only together with the Service;
+  (b) only to build, test and improve AI agents that you develop or operate for
+      your own internal business purposes; and
+  (c) only by your employees and individual contractors acting for you, who are
+      bound by this license and for whom you are responsible.
+
+You may let an AI coding assistant load and execute the Software as needed to
+run it under this license, and you may run it in your own continuous integration.
+You may keep the copies that installation, a package cache, a virtual environment,
+a container image used only for your own testing and routine backups create.
+
+4. RESTRICTIONS
+
+You must not, and must not allow or help anyone else to:
+
+  (a) copy the Software except as section 3 allows;
+  (b) modify, translate, adapt or create derivative works of the Software;
+  (c) distribute, publish, mirror, sell, rent, lease, lend, host, sublicense or
+      otherwise make the Software available to any third party;
+  (d) use the Software to provide a service to third parties, including as a
+      service bureau, consultancy deliverable or managed offering;
+  (e) use the Software, or anything learned from it, to design, build, improve,
+      train or offer any product or service that competes with the Software or
+      the Service;
+  (f) extract, copy or reuse any prompt, instruction, rubric, evaluation method,
+      schema, mocking logic or interception logic of the Software outside your
+      use of the Software under section 3;
+  (g) use the Software, in whole or in part, to train, fine-tune, evaluate or
+      benchmark any machine learning model, or to create a dataset for doing so;
+  (h) use the Software with any backend other than the Service, or build, operate
+      or use a substitute for, or emulation of, the Service;
+  (i) reverse engineer, decompile, disassemble, deobfuscate or try to derive the
+      source of any compiled or minified part of the Software, except to the
+      extent applicable law gives you that right despite this restriction;
+  (j) bypass, disable or interfere with any version check, credit or usage limit,
+      login, token control, anonymization or other control in the Software or
+      the Service;
+  (k) publish benchmarks or comparative performance results of the Software or
+      the Service without Plurai's prior written consent; or
+  (l) remove or alter any copyright, license or proprietary notice.
+
+5. YOUR OUTPUT
+
+As between you and Plurai, and subject to your rights in your own inputs and to
+any third party's rights in them, your Output belongs to you. You may use, change,
+commit and delete it. If Output contains any part of the Software, such as
+template code in a generated harness, you receive a perpetual license to use and
+modify that part only as part of that Output and only for your own agents. This
+section does not let you extract that part and use it separately, and it does not
+limit section 4 as to the Software itself.
+
+6. THIRD-PARTY COMPONENTS
+
+Third-party components included with the Software or installed alongside it are
+licensed under their own terms. Nothing in this license limits the rights those
+terms give you in those components.
+
+7. FEEDBACK
+
+If you give Plurai suggestions, issue reports or other feedback, Plurai may use
+them without restriction, obligation or payment. Feedback does not include your
+agent, your inputs or your Output.
+
+8. TERMINATION
+
+This license ends automatically and immediately, without notice, if you breach
+it, if you breach the Terms, if your Plurai account ends, or if you start or join
+any claim that the Software infringes an intellectual property right. Plurai may
+also suspend or end it at any time by notice. When it ends, you must stop using
+the Software and delete every copy, and at Plurai's request confirm that in
+writing. Your Output and sections 2, 4, 5, 7, 8, 9, 10, 11, 12 and 14 survive.
+
+9. COMPLIANCE
+
+On Plurai's written request, you will confirm in writing within 10 business days
+that your use complies with this license, and give the information reasonably
+needed to verify it.
+
+10. NO WARRANTY
+
+THE SOFTWARE IS PROVIDED "AS IS" AND "AS AVAILABLE", WITH ALL FAULTS AND WITHOUT
+WARRANTY OF ANY KIND. TO THE MAXIMUM EXTENT PERMITTED BY LAW, PLURAI DISCLAIMS ALL
+WARRANTIES, WHETHER EXPRESS, IMPLIED OR STATUTORY, INCLUDING MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE, TITLE AND NON-INFRINGEMENT. PLURAI DOES NOT
+WARRANT THAT THE SOFTWARE IS ERROR-FREE, THAT ANY SIMULATION RESULT, SCORE, FINDING
+OR PROPOSED FIX IS CORRECT OR COMPLETE, OR THAT AN AGENT TESTED WITH IT WILL BEHAVE
+SAFELY OR AS EXPECTED IN PRODUCTION. THE SOFTWARE RUNS YOUR AGENT AND CODE GENERATED
+FOR IT, WHICH MAY ACT ON YOUR FILES AND SYSTEMS. YOU ARE RESPONSIBLE FOR REVIEWING
+WHAT THEY DO AND FOR WHAT YOU DEPLOY.
+
+11. LIMITATION OF LIABILITY
+
+TO THE MAXIMUM EXTENT PERMITTED BY LAW, PLURAI AND ITS LICENSORS WILL NOT BE LIABLE
+FOR ANY INDIRECT, INCIDENTAL, SPECIAL, CONSEQUENTIAL, EXEMPLARY OR PUNITIVE DAMAGES,
+OR FOR LOST PROFITS, REVENUE, DATA OR GOODWILL, HOWEVER CAUSED AND EVEN IF ADVISED
+OF THE POSSIBILITY. THEIR TOTAL LIABILITY ARISING FROM THE SOFTWARE OR THIS LICENSE
+WILL NOT EXCEED THE GREATER OF (A) THE AMOUNTS YOU PAID PLURAI FOR THE SERVICE IN
+THE 12 MONTHS BEFORE THE CLAIM AND (B) USD 100.
+
+12. INDEMNITY
+
+You will defend and indemnify Plurai and its licensors against any third-party claim,
+loss or expense arising from your breach of this license, your agents, your inputs,
+or your use of Output.
+
+13. EXPORT AND SANCTIONS
+
+You must comply with all applicable export control and sanctions laws, and you must
+not use the Software where or by anyone those laws prohibit.
+
+14. GENERAL
+
+A breach of section 2 or 4 would cause Plurai irreparable harm, and Plurai may seek
+injunctive relief without posting bond, in addition to any other remedy. You may not
+assign this license without Plurai's written consent; any attempt to do so is void.
+Plurai may assign it freely. Plurai may change this license for future versions of
+the Software. If a provision is unenforceable, it applies to the greatest extent the
+law allows and the rest stays in effect. A failure to enforce a provision is not a
+waiver. Together with the Terms, this license is the entire agreement about the
+Software. If they conflict about the Software, this license controls.
+
+Contact: support@plurai.ai

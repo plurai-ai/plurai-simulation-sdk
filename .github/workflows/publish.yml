@@ -1,0 +1,148 @@
+# Publishes the SDK from the public mirror. The PyPI trusted publisher is bound to this file name and to the `pypi`
+# environment of the `publish-pypi` job, so neither can be renamed without changing the publisher on PyPI.
+#
+# A release tag publishes to PyPI when the repository variable PUBLISH_TARGET is `pypi`, which is the launch switch.
+# While it is `private-index` the release goes to the private development channel from the development repository, and
+# this workflow publishes nothing. An unset or unknown value stops the run.
+#
+# A person can also start the workflow by hand on a release tag, for a tag whose push started no run:
+# `gh workflow run publish.yml --ref v1.0.0`. A run on a branch, or on a tag that is not a release version, stops in the
+# first step of the `target` job, so nothing is published. The dispatch takes no input: the tag is the version, and the
+# index is chosen by PUBLISH_TARGET as for a push.
+#
+# The workflow is part of the release export. In the private development repository every job is skipped.
+name: publish
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  target:
+    if: github.repository == 'plurai-ai/plurai-simulation-sdk'
+    runs-on: ubuntu-latest
+    outputs:
+      target: ${{ steps.choose.outputs.target }}
+    steps:
+      # Every other job needs this one, so a run that stops here publishes nothing.
+      # The pattern is the one publish-pypi reads the version with.
+      - name: Accept a release tag only
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          [ "$REF_TYPE" = tag ] && [[ "$REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+((a|b|rc)[0-9]+)?$ ]] || { echo "${REF_TYPE} ${REF_NAME} is not a release tag; only a release tag is published" >&2; exit 1; }
+
+      # The full history is needed to tell whether the default branch contains the tagged commit.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Choose the index
+        id: choose
+        env:
+          PUBLISH_TARGET: ${{ vars.PUBLISH_TARGET }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          git merge-base --is-ancestor "$GITHUB_SHA" "origin/${DEFAULT_BRANCH}" || { echo "This commit is not on ${DEFAULT_BRANCH}; only default-branch commits are published" >&2; exit 1; }
+          case "$PUBLISH_TARGET" in
+            pypi | private-index) ;;
+            *) echo "PUBLISH_TARGET must be pypi or private-index, not '${PUBLISH_TARGET}'" >&2; exit 1 ;;
+          esac
+          echo "target=${PUBLISH_TARGET}" >> "$GITHUB_OUTPUT"
+
+  package:
+    needs: target
+    uses: ./.github/workflows/package.yml
+
+  # The job `if` of publish-pypi is the repository guard and nothing else, so the test of the target sits in this job.
+  # While it is skipped, publish-pypi is skipped before its environment, which has required reviewers, is asked.
+  only-pypi:
+    needs: target
+    if: needs.target.outputs.target == 'pypi'
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "PUBLISH_TARGET is pypi; the release goes to PyPI."
+
+  publish-pypi:
+    needs: [target, package, only-pypi]
+    if: github.repository == 'plurai-ai/plurai-simulation-sdk'
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      # The package workflow has already checked that the tag equals the version in pyproject.toml.
+      - name: Read the version from the tag
+        id: version
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          [[ "$REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+((a|b|rc)[0-9]+)?$ ]] || { echo "Tag ${REF_NAME} is not a release version" >&2; exit 1; }
+          echo "version=${REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist
+          path: dist/
+      # Publishing generates PEP 740 attestations by default.
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+
+  # Reads the version back from PyPI after the upload. The job is part of the shipped file, so it calls no workflow of another
+  # repository: it reads public PyPI only and holds no permission, no secret and no token. The job carries the guard of the upload job.
+  served-version:
+    name: Served by PyPI
+    needs: [publish-pypi]
+    if: github.repository == 'plurai-ai/plurai-simulation-sdk'
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - uses: astral-sh/setup-uv@18d369b23da25a81e9458561248e1aafff6a70fa # v10.3.1
+        with:
+          python-version: "3.12"
+
+      - name: Install the uploaded version from PyPI and check it
+        env:
+          PACKAGE: plurai-simulation-sdk
+          IMPORT_NAME: plurai
+          VERSION: ${{ needs.publish-pypi.outputs.version }}
+        run: |
+          set -euo pipefail
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+((a|b|rc)[0-9]+)?$ ]] || { echo "'${VERSION}' is not a release version" >&2; exit 1; }
+          uv venv --seed --python 3.12 "$RUNNER_TEMP/venv"
+          # PyPI takes a while to serve a new upload: eight tries with a growing wait, about seven minutes in all.
+          for attempt in 1 2 3 4 5 6 7 8; do
+            if "$RUNNER_TEMP/venv/bin/python" -m pip install --no-cache-dir --index-url https://pypi.org/simple "${PACKAGE}==${VERSION}"; then
+              break
+            fi
+            if [ "$attempt" -eq 8 ]; then
+              echo "::error title=Not served::PyPI did not serve ${PACKAGE}==${VERSION} within the time limit." >&2
+              exit 1
+            fi
+            sleep $((attempt * 15))
+          done
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/venv/bin/python" -I - <<'PY'
+          import importlib
+          import importlib.metadata
+          import os
+
+          package, module, expected = os.environ["PACKAGE"], os.environ["IMPORT_NAME"], os.environ["VERSION"]
+          installed = importlib.metadata.version(package)
+          if installed != expected:
+              raise SystemExit(f"{package} {installed} is installed, not {expected}")
+          reported = getattr(importlib.import_module(module), "__version__", expected)
+          if reported != expected:
+              raise SystemExit(f"{module}.__version__ is {reported}, not {expected}")
+          print(f"{package} {expected} is served by PyPI and imports as {module}")
+          PY

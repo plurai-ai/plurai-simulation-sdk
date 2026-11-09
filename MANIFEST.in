@@ -1,0 +1,3 @@
+# setuptools adds test*.py files to an sdist on its own. The tests are not part of the package, and the release export
+# leaves tests/ out of the mirror, so the sdist built here must not carry them either.
+prune tests

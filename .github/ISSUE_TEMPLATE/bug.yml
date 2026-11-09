@@ -1,0 +1,70 @@
+name: Bug report
+description: Something failed or behaved differently from what the documentation says.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Plurai clients send no telemetry, so what you paste here is all support has. Run `plurai diagnose` and paste its
+        output below: it holds versions, presence flags and ids, never a token or a file from your project.
+  - type: input
+    id: sdk-version
+    attributes:
+      label: SDK version
+      description: Output of `plurai --version`.
+      placeholder: "plurai 1.0.0"
+    validations:
+      required: true
+  - type: input
+    id: plugin-version
+    attributes:
+      label: Plugin version
+      description: The version of the Plurai simulation plugin, or "not used".
+    validations:
+      required: true
+  - type: dropdown
+    id: harness
+    attributes:
+      label: Harness
+      description: The coding agent the plugin runs in.
+      options:
+        - Claude Code
+        - Codex
+        - GitHub Copilot
+        - Other
+        - Not using the plugin
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: "macOS 15.1 arm64"
+    validations:
+      required: true
+  - type: input
+    id: python
+    attributes:
+      label: Python version
+      description: Output of `python --version`.
+    validations:
+      required: true
+  - type: input
+    id: command-run-id
+    attributes:
+      label: Command run id
+      description: The `Command run id` line of `plurai diagnose`, or the id the failing command printed. Leave empty if there is none.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened, and what you expected
+      description: The command you ran and the message it printed. Remove anything private first.
+    validations:
+      required: true
+  - type: textarea
+    id: bundle
+    attributes:
+      label: Output of `plurai diagnose`
+      render: text
+    validations:
+      required: true

@@ -1,0 +1,91 @@
+# Installs the package into a fresh environment on each supported Python and runs the import smoke test. The files come
+# from the `dist` artifact of the same run: `source: dist` installs the built wheel, `source: testpypi` installs the wheel
+# that TestPyPI serves for that version after checking that it has the same bytes as the built one.
+#
+# The dependencies resolve from PyPI. While a dependency is not on PyPI yet, the repository variable DEPENDENCY_INDEX_URL
+# names one more index to search, for example the TestPyPI simple index.
+name: smoke
+
+on:
+  workflow_call:
+    inputs:
+      source:
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    if: github.repository == 'plurai-ai/plurai-simulation-sdk'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@18d369b23da25a81e9458561248e1aafff6a70fa # v10.3.1
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist
+          path: ${{ runner.temp }}/dist
+
+      # pip, not uv: the environment under test is the one a user gets from `pip install`.
+      - name: Create the environment
+        run: uv venv --seed --python "${{ matrix.python-version }}" "$RUNNER_TEMP/venv"
+
+      - name: Pick the wheel to install
+        id: wheel
+        env:
+          SOURCE: ${{ inputs.source }}
+        working-directory: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          built=$(ls dist/*.whl)
+          case "$SOURCE" in
+            dist) echo "path=${built}" >> "$GITHUB_OUTPUT" ;;
+            testpypi)
+              name=$(basename "$built" | cut -d- -f1)
+              version=$(basename "$built" | cut -d- -f2)
+              mkdir published
+              # The index can take a minute to serve a file that was just uploaded.
+              for attempt in 1 2 3 4 5 6 7 8; do
+                venv/bin/python -m pip download --no-deps --only-binary=:all: --index-url https://test.pypi.org/simple/ \
+                  --dest published "${name}==${version}" && break
+                [ "$attempt" -lt 8 ] || { echo "TestPyPI does not serve ${name}==${version}" >&2; exit 1; }
+                sleep 15
+              done
+              served=$(ls published/*.whl)
+              [ "$(sha256sum "$built" | cut -d' ' -f1)" = "$(sha256sum "$served" | cut -d' ' -f1)" ] \
+                || { echo "The wheel on TestPyPI differs from the wheel that was built" >&2; exit 1; }
+              echo "path=${served}" >> "$GITHUB_OUTPUT"
+              ;;
+            *) echo "unknown source ${SOURCE}" >&2; exit 1 ;;
+          esac
+
+      - name: Install the wheel
+        working-directory: ${{ runner.temp }}
+        env:
+          WHEEL: ${{ steps.wheel.outputs.path }}
+          DEPENDENCY_INDEX_URL: ${{ vars.DEPENDENCY_INDEX_URL }}
+        run: |
+          set -euo pipefail
+          extra=()
+          [ -z "$DEPENDENCY_INDEX_URL" ] || extra=(--extra-index-url "$DEPENDENCY_INDEX_URL")
+          venv/bin/python -m pip install "${extra[@]}" "$WHEEL"
+
+      # Run outside the checkout so that the import comes from the installed wheel.
+      - name: Import smoke test
+        working-directory: ${{ runner.temp }}
+        env:
+          CHECK: ${{ github.workspace }}/.github/scripts/check_dist.py
+        run: |
+          version=$(basename "$(ls dist/*.whl)" | cut -d- -f2)
+          venv/bin/python "$CHECK" smoke --distribution plurai-simulation-sdk --module plurai --version "$version" \
+            --script plurai-run-simulation --script plurai --script plurai-scan-contract
