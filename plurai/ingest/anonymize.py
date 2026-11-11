@@ -52,7 +52,6 @@ import io
 import json
 import logging
 import os
-import re
 import secrets
 from collections.abc import Callable, Iterable
 from concurrent.futures import ProcessPoolExecutor
@@ -403,40 +402,6 @@ def _scrub_pdf(raw: bytes, redactor: Any, ir: SimpleNamespace) -> bytes:  # noqa
 
 
 # --------------------------------------------------------------------------- #
-# The shape a real generated id has (free-text `protected` substring safety net) #
-# --------------------------------------------------------------------------- #
-
-#: The shape EVERY real generated scenario id actually has, wherever it is produced —
-#: the backend's scenario-name slugifier lowercases and strips everything but
-#: ``[a-z0-9_]``, then every writer prefixes a numbered segment (``scenario_{n:02d}_{slug}``,
-#: ``scenario_{n:02d}_scenarios_<hash>_scenario_{n:02d}``, …): lowercase, ``[a-z0-9_]`` only, and
-#: made of TWO OR MORE underscore-joined segments — never a single bare word or letter. A
-#: ``protected`` string this does NOT match is treated as not-an-id (see
-#: ``_free_text_protected``) rather than trusted blindly: a short/common one used as a literal
-#: substring key inside free text (a bare ``'a'`` or ``'test'``) can corrupt REAL PII sitting next
-#: to it before Presidio ever sees the mangled remainder — this is a general-purpose module with
-#: no way to know a given caller's ids always look like this, so the shape is the one thing it CAN
-#: check, not a length guess (a length floor is trivially satisfied by "test" too).
-#:
-#: The trailing ``_?`` is real, not slack: the slugifier strips every character outside
-#: ``[a-z0-9_]`` BEFORE the numbered prefix is joined on, so an all-non-ASCII scenario name
-#: (nothing survives the strip) mints ``scenario_{n:02d}_`` — e.g. ``scenario_03_`` — a literal id
-#: with a bare trailing underscore. Without the ``_?`` that id fails ``(?:_[a-z0-9]+)+`` (its last
-#: group has nothing after the underscore) and falls through as "not an id", one word-boundary
-#: swap away from corrupting real PII beside it. One optional trailing underscore only — not `_*`,
-#: which would also accept multiple trailing underscores no producer mints.
-_GENERATED_ID_SHAPE = re.compile(r'^[a-z][a-z0-9]*(?:_[a-z0-9]+)+_?$')
-
-
-def _free_text_protected(protected: frozenset[str]) -> frozenset[str]:
-    """The subset of ``protected`` safe to swap as a literal SUBSTRING inside free text — see
-    ``_GENERATED_ID_SHAPE``. Never applied to :meth:`Anonymizer.anonymize_obj`'s JSON branch,
-    which exempts only EXACT whole-key/whole-value matches and so carries none of this risk —
-    the id shape restricts a different, weaker operation, not the general concept of "protected"."""
-    return frozenset(term for term in protected if _GENERATED_ID_SHAPE.fullmatch(term))
-
-
-# --------------------------------------------------------------------------- #
 # Structure-preserving JSON walk (shared by the full scrubber)                  #
 # --------------------------------------------------------------------------- #
 
@@ -609,74 +574,18 @@ class Anonymizer:
         self,
         obj: Any,  # noqa: ANN401 - arbitrary decoded JSON
         *,
-        protected: frozenset[str] = frozenset(),
         exempt_key: Callable[[str], bool] | None = None,
         hooks: TreeHooks | None = None,
     ) -> Any:  # noqa: ANN401
         """Anonymize decoded JSON (string leaves AND keys), preserving structure.
 
-        ``protected``: exact strings that ride through UNALTERED wherever they appear, as a dict
-        key or a leaf value — never even reaching Presidio, so the result cannot depend on
-        whether a given NER model happens to flag that particular string. For a STRUCTURAL id
-        (a scenario id) that must stay joinable to a sibling artifact's un-scrubbed content
-        elsewhere in the same upload: pseudonymizing it would break the very join the protection
-        exists to make — the same reasoning ``_run_artifacts_scrub_unit`` (``ingest/cli.py``)
-        applies to ``run_summary.json``, parametrized here instead of an all-or-nothing file
-        skip, because THIS content can also carry real free-text PII beside the ids (a rooted
-        finding's quoted turn). Empty (the default) protects nothing.
-
         ``exempt_key`` names dict keys that keep their spelling (a key an agent description already declares);
         a leaf value is never exempted by it. ``hooks`` follow the walk (see :class:`TreeHooks`).
         """
-        if not protected and exempt_key is None:
-            return _scrub_tree(obj, self.anonymize_value, self._scrub_key, hooks)
+        scrub_key = self._scrub_key if exempt_key is None else (lambda k: k if exempt_key(k) else self._scrub_key(k))
+        return _scrub_tree(obj, self.anonymize_value, scrub_key, hooks)
 
-        def scrub_value(v: str) -> str:
-            return v if v in protected else self.anonymize_value(v)
-
-        def scrub_key(k: str) -> str:
-            return k if k in protected or (exempt_key is not None and exempt_key(k)) else self._scrub_key(k)
-
-        return _scrub_tree(obj, scrub_value, scrub_key, hooks)
-
-    def _anonymize_text(self, text: str, protected: frozenset[str]) -> str:
-        """Free-text PII scrub (the markdown/plain-text branch of :meth:`anonymize_file`), with
-        ``protected`` swapped out for placeholders before analysis and restored after — so a
-        protected id embedded inside an otherwise-scrubbed sentence can never be flagged,
-        regardless of what the NER model would or would not do with it on its own.
-
-        Two safety nets, because a naive literal substring swap corrupts ADJACENT real PII before
-        Presidio ever sees it (``protected={'a'}`` next to ``"Amanda Aguilar ...
-        amanda.aguilar@example.com"`` would cut the ``'a'`` out of the middle of both and leave the
-        mangled remainder unrecognized — a real name and email surviving fully unscrubbed):
-
-        * only :func:`_free_text_protected`'s id-shaped subset is even considered — a short or
-          generic ``protected`` string is ignored here rather than trusted (see its docstring);
-        * of THOSE, only WHOLE-TOKEN occurrences are swapped — bounded by ``\\b`` on both sides, so
-          a match can never start or end mid-word. Ids are ``[a-z0-9_]+``-shaped, exactly
-          Python's ``\\w``, so a plain word boundary is the right bound; this also disambiguates a
-          prefix relationship (``scenario_1`` beside ``scenario_10``) for free, without needing a
-          longest-first ordering trick.
-        """
-        ids = _free_text_protected(protected)
-        present = [term for term in ids if term in text]
-        if not present:
-            return self.anonymize_value(text)
-        pattern = re.compile(r'\b(?:' + '|'.join(re.escape(term) for term in sorted(present, key=len, reverse=True)) + r')\b')
-        tokens: dict[str, str] = {}
-
-        def stash(match: re.Match[str]) -> str:
-            token = f'\x00PLURAI_PROTECTED_{len(tokens)}\x00'
-            tokens[token] = match.group(0)
-            return token
-
-        working = pattern.sub(stash, text)
-        scrubbed = self.anonymize_value(working)
-        for token, term in tokens.items():
-            scrubbed = scrubbed.replace(token, term)
-        return scrubbed
-
-    def anonymize_file(self, path: str | Path, *, protected: frozenset[str] = frozenset()) -> None:
+    def anonymize_file(self, path: str | Path) -> None:
         """Scrub a file in place (atomic), dispatching on content type.
 
         Real ingest inputs are mixed (a bundle carries ``record.json`` + markdown
@@ -689,11 +598,6 @@ class Anonymizer:
           asset or a missing binary dep FAILS CLOSED (:class:`DocExampleBinaryError` /
           :class:`AnonymizationDependencyError`) and nothing is written (the scrub runs
           BEFORE any temp file is created, so the original is untouched on failure).
-
-        ``protected``: exact strings (structural ids) that must survive verbatim wherever they
-        occur — as a JSON key/value (:meth:`anonymize_obj`) or as an exact substring of free text
-        (:meth:`_anonymize_text`). Not applied to the binary branch: a binary asset carries no
-        join-key text to protect. Empty (the default) protects nothing.
         """
         p = Path(path)
         raw = p.read_bytes()
@@ -708,9 +612,9 @@ class Anonymizer:
         try:
             data = json.loads(text)
         except json.JSONDecodeError:
-            scrubbed = self._anonymize_text(text, protected)  # free-text body (markdown, plain text, …)
+            scrubbed = self.anonymize_value(text)  # free-text body (markdown, plain text, …)
         else:
-            scrubbed = json.dumps(self.anonymize_obj(data, protected=protected), ensure_ascii=False)
+            scrubbed = json.dumps(self.anonymize_obj(data), ensure_ascii=False)
         tmp = p.with_name(f'{p.name}.tmp')
         tmp.write_text(scrubbed, encoding='utf-8')
         tmp.replace(p)  # atomic in-place swap

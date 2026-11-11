@@ -27,7 +27,7 @@ from plurai import _private_files
 from plurai._platform import is_windows
 from plurai.ingest.anonymize import KEY_DIR_NAME, _ensure_key_dir_gitignored
 from plurai.ingest.folder_names import PSEUDONYMIZED_FOLDER_KINDS
-from plurai.ingest.posture import CONFIG_FILENAME, POSTURE_CONFIG_KEY, AnonymizationPosture
+from plurai.ingest.posture import CONFIG_FILENAME, POSTURE_CONFIG_KEY, RUN_KINDS, AnonymizationPosture
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +44,8 @@ DISCLOSURE_RELPATH_TEMPLATE = f'{KEY_DIR_NAME}/uploads/disclosure-{{kind}}.txt'
 #: The audit record ``event`` of a part's upload outcome and of a part whose upload failed.
 PART_UPLOAD_EVENT = 'part_upload'
 PART_UPLOAD_FAILED_EVENT = 'part_upload_failed'
+#: The raw banner's opt-in line, shown only when nothing declared a posture for an env-build upload.
+_OPT_IN_NAG = "  !! opt in per env: set 'anonymize: true' in plurai.config.yaml (requires plurai-simulation-sdk[anonymize])"
 
 
 def _legal_lines() -> list[str]:
@@ -75,9 +77,12 @@ class MixedPostureError(ValueError):
     ``main()`` handler → clean exit, not a raw traceback."""
 
 
-def assert_posture_consistent(workspace_root: str | Path, posture: AnonymizationPosture) -> None:
+def assert_posture_consistent(workspace_root: str | Path, posture: AnonymizationPosture, *, kind: str) -> None:
     """Fail closed (:class:`MixedPostureError`) if this workspace already uploaded under a *different*
     posture than ``posture``. No audit log yet → pass (nothing to conflict with).
+
+    A run kind (:data:`~plurai.ingest.posture.RUN_KINDS`) is outside the fence both ways: its upload is
+    never checked, and its records never fix the env's posture, because the posture does not govern it.
 
     A record with **no** ``posture`` field counts as ``'anonymized'``: the field is optional in the
     log format, and a record without it is read as anonymized. Unparseable audit
@@ -90,8 +95,8 @@ def assert_posture_consistent(workspace_root: str | Path, posture: Anonymization
     check is the local first line of defense.
     """
     log_path = Path(workspace_root) / AUDIT_LOG_RELPATH
-    if not log_path.exists():
-        return  # no prior uploads in this workspace → nothing to conflict with
+    if kind in RUN_KINDS or not log_path.exists():
+        return  # a run upload has no posture to keep; no prior uploads in this workspace → nothing to conflict with
     with log_path.open('r', encoding='utf-8') as fh:
         for raw_line in fh:
             stripped = raw_line.strip()
@@ -108,6 +113,8 @@ def assert_posture_consistent(workspace_root: str | Path, posture: Anonymization
                 continue  # an upload outcome restates a part record that already fixed the posture
             if 'posture' in record and record['posture'] is None:
                 continue  # an agent description part is not scrubbed and has no posture to conflict with
+            if record.get('kind') in RUN_KINDS:
+                continue  # a run's own output uploads as-is in every env and fixes no posture
             prior = record.get('posture', 'anonymized')  # a record without the field is read as anonymized
             if prior != posture:
                 raise MixedPostureError(
@@ -160,13 +167,21 @@ class UploadPreview:
             # raw, so both keep the unscrubbed warning; only the second is news, and only the
             # second gets the opt-in nag — repeating it at an operator who already wrote
             # ``anonymize: false`` teaches them to skim the whole banner.
+            # A run kind is raw by rule, not by declaration, so it gets neither provenance nor the nag.
+            run = self.kind in RUN_KINDS
             declared = self.posture_source is not None
+            if run:
+                posture_line = "  posture: RAW (a simulation run's output always uploads as-is; `anonymize:` governs only the env's build uploads)"
+            elif declared:
+                posture_line = f'  posture: RAW (declared in {self.posture_source})'
+            else:
+                posture_line = '  posture: RAW (anonymization off — nothing declared one)'
             return '\n'.join(
                 [
                     'Plurai ingestion — pre-upload disclosure',
-                    f'  posture: RAW (declared in {self.posture_source})' if declared else '  posture: RAW (anonymization off — nothing declared one)',
+                    posture_line,
                     '  !! data will be uploaded UNSCRUBBED; processing is governed by your DPA with Plurai',
-                    *([] if declared else ["  !! opt in per env: set 'anonymize: true' in plurai.config.yaml (requires plurai-simulation-sdk[anonymize])"]),
+                    *([] if declared or run else [_OPT_IN_NAG]),
                     f'  kind:    {self.kind}',
                     f'  target:  {self.target}',
                     *self._source_lines(),

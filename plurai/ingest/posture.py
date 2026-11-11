@@ -6,6 +6,9 @@ The posture is a durable **per-env declaration**, never a per-run flag, so it li
 workspace config; the first plugin ingest skill writes it once, from the operator's answer, and every
 ingest run reads it.
 
+The posture governs only the data uploaded while the env is built. What a simulation run produced
+(:data:`RUN_KINDS`) always uploads as-is, stamped ``raw``, and never reads the posture.
+
 Config contract (verbatim) — the first plugin ingest skill writes this, from the operator's answer; the SDK reads it:
 
 * File: ``plurai.config.yaml``. Key: top-level ``anonymize: true | false`` (strict YAML bool).
@@ -52,6 +55,10 @@ AnonymizationPosture = Literal['raw', 'anonymized']
 
 #: Top-level config key whose strict YAML bool declares the posture.
 POSTURE_CONFIG_KEY = 'anonymize'
+
+#: The ingest kinds that carry a simulation run's own output. The posture does not govern them: they
+#: upload as-is in every env, and neither fix nor meet the env's posture in the mixed-posture fence.
+RUN_KINDS = frozenset({'run-artifacts', 'run-report'})
 
 
 class PostureConfigError(WorkspaceConfigError):
@@ -111,6 +118,7 @@ def resolve_posture(workspace_root: str | Path = '.') -> PostureResolution:
 __all__ = [
     'CONFIG_FILENAME',
     'POSTURE_CONFIG_KEY',
+    'RUN_KINDS',
     'AnonymizationPosture',
     'PostureConfigError',
     'PostureResolution',

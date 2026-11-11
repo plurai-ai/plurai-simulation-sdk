@@ -4,14 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "plurai-simulation-sdk"
-version = "1.0.0"
+version = "1.0.1"
 description = "Simulate conversations against your AI agent and score it on your policies."
 readme = "README.md"
 license = {text = "Proprietary"}
 # The floor is 3.12, the lowest version every tested surface runs on: the arize and
 # braintrust sink extras, the mock engine's own floor, and `sys.monitoring` (PEP 669) in
 # the entry witness. The CI matrix tests 3.12 and 3.13; the classifiers below list the same
-# versions and tests/test_python_floor.py keeps the surfaces in agreement.
+# versions.
 requires-python = ">=3.12"
 classifiers = [
     "License :: Other/Proprietary License",
@@ -124,10 +124,6 @@ Repository = "https://github.com/plurai-ai/plurai-simulation-sdk"
 Issues = "https://github.com/plurai-ai/plurai-simulation-sdk/issues"
 Changelog = "https://github.com/plurai-ai/plurai-simulation-sdk/blob/main/CHANGELOG.md"
 
-# For local co-development against an editable plurai-mockenv checkout, add an UNCOMMITTED override:
-#   [tool.uv.sources]
-#   plurai-mockenv = { path = "../plurai-mockenv", editable = true }
-
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["plurai*"]
@@ -175,7 +171,7 @@ dev = [
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
-# Integration tests need a local Plurai backend checkout and are opt-in: `uv run --no-sync pytest -m integration`.
+# Integration tests are opt-in: `uv run --no-sync pytest -m integration`.
 addopts = '-m "not integration"'
 markers = [
     "integration: requires a local backend checkout; run with -m integration",
@@ -300,8 +296,7 @@ include = ["plurai"]
 exclude = ["**/__pycache__", "**/*_generated.py"]
 typeCheckingMode = "basic"
 pythonVersion = "3.12"
-# A sibling editable install of plurai-mockenv (PEP 660 finder hook) is invisible to pyright, so the
-# sibling source is on the path too. Harmless where plurai-mockenv is a normally installed package.
+# pyright does not see an editable install made through a PEP 660 finder hook, so this path covers one.
 extraPaths = ["../plurai-mockenv"]
 reportArgumentType = "warning"
 reportOptionalMemberAccess = "warning"

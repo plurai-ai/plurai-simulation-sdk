@@ -2,12 +2,14 @@
 
 Each subcommand runs the existing local extractor, applies the env's **anonymization posture**
 — under ``anonymized`` it scrubs the output with the full scrubber (fail-closed — no raw path
-*within* an anonymized env); under ``raw`` (the default) it bundles the extractor output
-verbatim, minting no key and never importing Presidio — bundles ALL units into ONE streamed
+*within* an anonymized env's build uploads); under ``raw`` (the default) it bundles the extractor output
+verbatim, minting no key and never importing Presidio — then it bundles ALL units into ONE streamed
 ``.tar.gz`` (tar member name == each unit's manifest ``key``), uploads that archive ONCE to the storage service via
 :class:`~plurai.ingest.storage_client.StorageClient`, writes the disclosure preview +
 ``.plurai/uploads/audit.log``, and prints the **single-archive manifest** to stdout so the plugin
 can hand it to the backend's ``*_start(manifest=...)`` MCP tool (the server mints the job/set id).
+The run kinds (``ingest-run``, ``ingest-run-report``) are always ``raw``: the posture governs only what
+is uploaded while the env is built.
 
 Stream contract: stdout is the manifest and NOTHING else (the plugin captures it verbatim) — except
 under ``ingest-corpus --extract-only``, which stops before any egress and puts the local extraction
@@ -134,7 +136,7 @@ from plurai.ingest.claim_scrub import Claim, claim_scrub_unit, load_claims
 from plurai.ingest.scrub_map import MEMBER_NAME as SCRUB_MAP_MEMBER
 from plurai.ingest.scrub_map import ScrubMapError, ScrubRecorder, load_declared_names, scrub_trace_tree
 from plurai.issue_turn import ISSUE_TURN_FILENAME, issue_turn_problem
-from plurai.ingest.posture import POSTURE_CONFIG_KEY, AnonymizationPosture, PostureConfigError, resolve_posture
+from plurai.ingest.posture import POSTURE_CONFIG_KEY, RUN_KINDS, AnonymizationPosture, PostureConfigError, PostureResolution, resolve_posture
 from plurai.ingest.storage_client import (
     MAX_OBJECT_NAME_LENGTH,
     PartUploadUnsupportedError,
@@ -900,7 +902,7 @@ def run_units(run_dir: str | Path) -> list[Unit]:
         walks='archived whatever scenario-shaped folders happen to sit',
         hint=(
             'Pass the run output dir explicitly; if the value came from a $(cat ...) of the run pointer, that pointer is '
-            'missing — the runner writes it only for a run that ran rows, and an older runner writes none at all.'
+            'missing — the runner writes it only for a run that ran rows.'
         ),
     )
     units: list[Unit] = []
@@ -1310,43 +1312,6 @@ def _doc_example_scrub_unit(scrubber: Anonymizer, unit: Unit) -> None:
     tmp.replace(unit.path)  # atomic in-place swap
 
 
-def _run_artifacts_scrub_unit(scrubber: Anonymizer, unit: Unit) -> None:
-    """Run-artifacts unit scrub: every scenario artifact as usual, the run-LEVEL summary VERBATIM.
-
-    ``run_summary.json`` is the only member of this kind that is not a conversation, and the
-    generic scrub is wrong for it in the way that costs the most. ``_default_scrub_unit``
-    anonymizes every string leaf AND KEY, Presidio runs with no ``entities=`` filter, and its
-    DATE_TIME recognizer fires on some ordinary scenario ids — as a VALUE in ``graded_scenarios``
-    / ``ran_this_invocation`` and as the KEY of every per-row map (``scenarios``,
-    ``ended_early_scenarios``, ``degraded_scenarios``, ``echoes_dropped_scenarios``,
-    ``turn_cap_reruns``, ``scenario_timings``, ``measurement_integrity``) — and on every
-    ``written_at``, ``started_at`` and ``ended_at``. Structural field names are exposed on the same channel and survive only by luck of
-    spelling: ``duration_seconds`` is left alone, a bare ``seconds`` is not.
-
-    Why that is corruption rather than over-caution. The archive's ``<scenario>/<file>`` member
-    keys are folder NAMES and are never scrubbed, so this file's per-row maps are the only place
-    those ids exist as CONTENT — and the scrub is content-dependent, so it de-joins the summary
-    from the folders it describes one row at a time. ``degraded_scenarios`` /
-    ``ended_early_scenarios`` keyed by a pseudonym match no row, and a degraded or given-up
-    scenario then reads as an ordinary low-score agent failure. The sibling case follows the same
-    rule — the manifest's provenance ids ride an anonymized ingest unscrubbed, because
-    pseudonymizing them would break the join the block exists to make — and the join is the whole
-    point of this member too.
-
-    Passing the WHOLE file rather than allowlisting fields, deliberately. There is no customer
-    conversation in it: counts, booleans, Plurai-minted scenario ids, the typed
-    ``ended_early``/status vocabularies, ISO timestamps, and the backend's own integrity blocks —
-    which describe the measuring apparatus (a raising guard, an errored judge, a broken target
-    check), not the dialog, and whose dialog-bearing source (the judges' cells) is scrubbed in
-    ``verdicts.json`` in this same archive. A per-field allowlist would also be the
-    wrong shape: the payload gains keys, and a scrub that silently stops covering a new key
-    de-joins the summary unannounced.
-    """
-    if unit.key == RUN_SUMMARY_FILENAME:
-        return  # run-LEVEL verdict: ids + counts + enums + timestamps, all of them joins
-    _default_scrub_unit(scrubber, unit)
-
-
 def _units_root(units: Sequence[Unit]) -> Path:
     """The directory every unit key is relative to (``<root>/<key>`` is the unit's path)."""
     first = units[0]
@@ -1566,7 +1531,14 @@ def _prepared_units(units: list[Unit], plan: _UnitPlan, *, err: TextIO) -> Itera
 
     # Posture-consistency fence BEFORE any dep check / scrub / egress: refuse to add a
     # differently-postured upload to an env that already shipped one.
-    assert_posture_consistent(workspace_root, posture)
+    assert_posture_consistent(workspace_root, posture, kind=kind)
+    # Defence in depth behind `_dispatch`'s raw stamp: a run kind is the simulation's own output and
+    # is never scrubbed, so a caller that reaches this with a run kind under any other posture is refused.
+    if kind in RUN_KINDS and posture != 'raw':
+        raise ValueError(
+            f'{kind!r} is a run kind and uploads raw whatever the anonymization posture '
+            f'(the posture governs only the env-build uploads); got posture {posture!r}'
+        )
 
     with contextlib.ExitStack() as staging_scope:
         scrubber: Anonymizer | None = None
@@ -1873,7 +1845,10 @@ def _dispatch(
     # data out of the machine, which uploads only under a DECLARED posture (an absent `anonymize:` is
     # nobody's answer, so it is refused rather than read as raw); False for material our own simulated
     # runs produced, which keeps the default.
-    resolution = resolve_posture(args.workspace_root)
+    #
+    # The posture governs only what is uploaded while the env is built: a run kind's units are the
+    # simulation's own output and upload as-is, so the config is not read for them.
+    resolution = PostureResolution(posture='raw', source=None) if kind in RUN_KINDS else resolve_posture(args.workspace_root)
     if resolution.source is None and declaration_required:
         raise PostureConfigError(
             f'no `{POSTURE_CONFIG_KEY}:` declaration under {args.workspace_root}, and {kind} carries customer data. '
@@ -1952,7 +1927,7 @@ def _dispatch(
     return 0
 
 
-#: The MCP tool this CLI's ``run-artifacts`` manifest is handed to, and the parameter names it
+#: The public MCP tool of the Plurai plugin that this CLI's ``run-artifacts`` manifest is handed to, and the parameter names it
 #: takes the provenance under. Named here rather than only in prose so the hand-off notice
 #: cannot drift from the call it describes.
 _RUN_UPLOAD_TOOL = 'upload_run_artifacts_start'
@@ -2458,10 +2433,9 @@ def _scrub_home_paths(staged: Sequence[Unit]) -> None:
 
 
 def _cmd_run(args: argparse.Namespace) -> int:
-    # No SDK extractor — but unlike the other no-extractor kind (ingest-bundle, whose input dir is
-    # hand-authored and re-creatable), $OUT is the customer's ONLY record of the finished run, and
-    # under an anonymized env _dispatch scrubs every unit IN PLACE. Dispatch copies instead, so the
-    # original artifacts are never rewritten.
+    # No SDK extractor, and no anonymization in any posture: a run kind uploads the run as it is
+    # (RUN_KINDS). $OUT is the customer's ONLY record of the finished run, and the staged copies are
+    # what gets its trial stamp and home-path hygiene, so the original artifacts are never rewritten.
     units = run_units(args.run_dir)
     with tempfile.TemporaryDirectory(prefix='plurai-ingest-run-') as staging:
         staged: list[Unit] = []
@@ -2478,73 +2452,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
             kind='run-artifacts',
             declaration_required=False,
             provenance=_run_provenance(args),
-            scrub_unit=_run_artifacts_scrub_unit,  # scenario artifacts scrubbed; the run-level verdict is joins, not prose
         )
-
-
-#: The `run_summary.json` fields whose ids must ride an anonymized report through VERBATIM — the
-#: SAME fields `_run_artifacts_scrub_unit`'s docstring names as the reason that file is kept
-#: verbatim wholesale. `run.json`/`analytics.md`/`eval_signal.md` cannot take that same all-or-
-#: nothing shortcut (they carry real free-text PII too — a rooted finding's quoted turn), so this
-#: reads the SAME id set out of the SAME source and protects only those exact strings instead.
-_SCENARIO_ID_LIST_FIELDS = ('graded_scenarios', 'ran_this_invocation')
-_SCENARIO_ID_KEYED_FIELDS = (
-    'scenarios',
-    'ended_early_scenarios',
-    'degraded_scenarios',
-    'echoes_dropped_scenarios',
-    'turn_cap_reruns',
-    'scenario_timings',
-    'measurement_integrity',
-)
-
-
-def _scenario_ids_from_run_summary(path: Path) -> frozenset[str]:
-    """The real scenario ids one `run_summary.json` names, unioned from every id-bearing field
-    (see `_SCENARIO_ID_LIST_FIELDS`/`_SCENARIO_ID_KEYED_FIELDS`). ``frozenset()`` for a missing or
-    unreadable file — a report with no protectable ids still scrubs, it just protects nothing."""
-    try:
-        parsed = json.loads(path.read_text(encoding='utf-8'))
-    except (OSError, ValueError):
-        return frozenset()
-    if not isinstance(parsed, dict):
-        return frozenset()
-    ids: set[str] = set()
-    for field in _SCENARIO_ID_LIST_FIELDS:
-        value = parsed.get(field)
-        if isinstance(value, list):
-            ids.update(v for v in value if isinstance(v, str))
-    for field in _SCENARIO_ID_KEYED_FIELDS:
-        value = parsed.get(field)
-        if isinstance(value, dict):
-            ids.update(k for k in value if isinstance(k, str))
-    return frozenset(ids)
-
-
-def _protected_report_ids(root: Path) -> frozenset[str]:
-    """Every scenario id a report's units (top-level + each trial) must never scrub — unioned
-    from the run's own `run_summary.json` and each trial's, so the SAME ids stay the SAME join
-    keys `ingest-run`'s archive already uses (its `<scenario>/<file>` member-key folder names,
-    never scrubbed there either) wherever the report names them."""
-    ids = set(_scenario_ids_from_run_summary(root / RUN_SUMMARY_FILENAME))
-    for trial_dir in _listed_trial_dirs(root):
-        ids.update(_scenario_ids_from_run_summary(root / trial_dir / RUN_SUMMARY_FILENAME))
-    return frozenset(ids)
-
-
-def _run_report_scrub_unit_for(protected: frozenset[str]) -> Callable[[Anonymizer, Unit], None]:
-    """Build the report's `scrub_unit`: the generic scrub (real free-text PII, e.g. a rooted
-    finding's quoted turn, still gets scrubbed), except every string in `protected` — a real
-    scenario id — rides through every unit verbatim, in `run.json`'s JSON tree and in
-    `analytics.md`/`eval_signal.md`'s markdown alike. Unlike `_run_artifacts_scrub_unit`'s
-    whole-file skip of `run_summary.json`, no unit here can be skipped wholesale: each one can
-    carry both real ids AND real dialogue.
-    """
-
-    def scrub(scrubber: Anonymizer, unit: Unit) -> None:
-        scrubber.anonymize_file(unit.path, protected=protected)
-
-    return scrub
 
 
 def _cmd_run_report(args: argparse.Namespace) -> int:
@@ -2556,8 +2464,7 @@ def _cmd_run_report(args: argparse.Namespace) -> int:
         print(f'plurai ingest-run-report: no report to attach ({absent_reason}); nothing uploaded', file=sys.stderr)
         print(json.dumps({'absent_reason': absent_reason}))  # stdout = what attach_run_report takes instead of a manifest
         return 0
-    protected = _protected_report_ids(Path(args.run_dir))
-    # Copied first, like ingest-run: an anonymized env scrubs units in place, and these are the operator's report.
+    # Copied first, like ingest-run: the home-path hygiene rewrites units in place, and these are the operator's report.
     with tempfile.TemporaryDirectory(prefix='plurai-ingest-run-report-') as staging:
         staged: list[Unit] = []
         for unit in units:
@@ -2566,7 +2473,7 @@ def _cmd_run_report(args: argparse.Namespace) -> int:
             shutil.copy2(unit.path, dest)
             staged.append(Unit(key=unit.key, path=dest))
         _scrub_home_paths(staged)
-        return _dispatch(args, units=staged, kind='run-report', declaration_required=False, scrub_unit=_run_report_scrub_unit_for(protected))
+        return _dispatch(args, units=staged, kind='run-report', declaration_required=False)
 
 
 def _cmd_folder_names(args: argparse.Namespace) -> int:

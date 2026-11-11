@@ -122,8 +122,10 @@ uploads one document you name and prints its size on stderr.
   `anonymize: true` in `plurai.config.yaml` (needs the `anonymize` extra) and the SDK scrubs personal data locally before
   upload, replacing it with a one-way keyed hash. The scrub fails closed: a missing package or model stops the run
   rather than uploading unscrubbed data. The key stays in a gitignored `.plurai/anon.key` and is never uploaded.
-- **An environment never mixes postures.** A run that would add a differently postured upload to an environment that
-  already has one is refused.
+- **The posture governs only the data uploaded while building the environment.** A simulation run's own artifacts
+  (`ingest-run`, `ingest-run-report`) always upload as they are, whatever `anonymize:` says.
+- **An environment never mixes postures.** A build upload that would add a differently postured upload to an
+  environment that already has one is refused.
 - **An archive over the backend's size cap never leaves the machine.** The SDK checks the cap first and names the largest
   files.
 - **The scan contract runs on your machine.** `plurai-scan-contract check` reads your corpus locally and writes its
@@ -307,7 +309,8 @@ credit refusals fails on a job that ends `terminal_reason: credit` instead of re
 | `plurai logout` | revokes the saved key and removes the credentials file |
 | `plurai diagnose` | prints a bundle to paste into a support issue |
 | `plurai capabilities`, `plurai --version` | print the version, the commands and the feature keys of this build |
-| `plurai ingest-corpus`, `ingest-traces`, `ingest-doc-examples`, `ingest-bundle`, `ingest-descriptions`, `ingest-run`, `ingest-run-report` | extract, optionally anonymize, and upload customer data, after the disclosure |
+| `plurai ingest-corpus`, `ingest-traces`, `ingest-doc-examples`, `ingest-bundle`, `ingest-descriptions` | extract, optionally anonymize, and upload customer data, after the disclosure |
+| `plurai ingest-run`, `ingest-run-report` | upload a simulation run's artifacts as-is (never anonymized, whatever `anonymize:` says), after the disclosure |
 | `plurai convert-trace` | turns a production trace export into a scenario that resumes from it |
 | `plurai stash-doc FILE LABEL` | uploads one generation input (a PRD, a variables file) and prints its id on stdout |
 | `plurai job status ID`, `plurai job wait ID` | read a backend job, or block until it ends |
