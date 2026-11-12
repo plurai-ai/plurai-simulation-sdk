@@ -25,7 +25,7 @@ from typing import Any
 
 from plurai import _private_files
 from plurai._platform import is_windows
-from plurai.ingest.anonymize import KEY_DIR_NAME, _ensure_key_dir_gitignored
+from plurai.ingest.anonymize import KEY_DIR_NAME, SCRUBBED_ENTITIES_DISCLOSURE, _ensure_key_dir_gitignored
 from plurai.ingest.folder_names import PSEUDONYMIZED_FOLDER_KINDS
 from plurai.ingest.posture import CONFIG_FILENAME, POSTURE_CONFIG_KEY, RUN_KINDS, AnonymizationPosture
 
@@ -44,6 +44,8 @@ DISCLOSURE_RELPATH_TEMPLATE = f'{KEY_DIR_NAME}/uploads/disclosure-{{kind}}.txt'
 #: The audit record ``event`` of a part's upload outcome and of a part whose upload failed.
 PART_UPLOAD_EVENT = 'part_upload'
 PART_UPLOAD_FAILED_EVENT = 'part_upload_failed'
+#: The anonymized disclosure's line naming what the scrub covers and what it sends as written.
+SCRUBBED_CLASSES_LINE = f'  covers:  {SCRUBBED_ENTITIES_DISCLOSURE}'
 #: The raw banner's opt-in line, shown only when nothing declared a posture for an env-build upload.
 _OPT_IN_NAG = "  !! opt in per env: set 'anonymize: true' in plurai.config.yaml (requires plurai-simulation-sdk[anonymize])"
 
@@ -200,6 +202,7 @@ class UploadPreview:
             f'  units:   {self.unit_count}',
             f'  bytes:   {self.total_bytes} (anonymized)',
             f'  scrubbed: {scrub}',
+            SCRUBBED_CLASSES_LINE,
             f'  key fingerprint: {self.key_fingerprint}',
             f'  posture: anonymized (declared in {self.posture_source})' if self.posture_source is not None else '  posture: anonymized',
             (

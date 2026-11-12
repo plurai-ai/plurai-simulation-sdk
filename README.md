@@ -122,6 +122,14 @@ uploads one document you name and prints its size on stderr.
   `anonymize: true` in `plurai.config.yaml` (needs the `anonymize` extra) and the SDK scrubs personal data locally before
   upload, replacing it with a one-way keyed hash. The scrub fails closed: a missing package or model stops the run
   rather than uploading unscrubbed data. The key stays in a gitignored `.plurai/anon.key` and is never uploaded.
+- **What the scrub covers**, in text, images and PDFs alike: person names, email addresses, phone numbers, card, IBAN
+  and bank numbers, SSN, ITIN, passport, driver-license, NHS and medical-license ids, IP and MAC addresses, crypto
+  wallets, places (city, region, country), and nationality, religion or political group. **Sent as written:** dates and
+  times (including dates of birth and ages), web addresses (including any personal data in a URL's query string),
+  organization names, UUIDs and any other detected type not listed. Of a street address usually only the city, sometimes
+  the state, is caught; the street line and postal code pass, and a state-and-ZIP token may be read as an organization
+  and pass. Detection is statistical: a word mistaken for a name (a dish named after a person) and some order numbers,
+  tracking numbers or SKUs read as bank or phone numbers are hashed too.
 - **The posture governs only the data uploaded while building the environment.** A simulation run's own artifacts
   (`ingest-run`, `ingest-run-report`) always upload as they are, whatever `anonymize:` says.
 - **An environment never mixes postures.** A build upload that would add a differently postured upload to an

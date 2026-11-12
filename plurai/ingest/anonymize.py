@@ -9,9 +9,12 @@ methods. A raw-posture env never builds an :class:`Anonymizer` at all (see :func
 
 Two steps, one keyed replacement:
 
-* **Detect** — PII (person names, emails, phone numbers, SSNs, locations, …) is detected
-  with Presidio's default ``AnalyzerEngine`` (spaCy NER + its built-in regex
-  recognizers). There is no declared-schema / identifier-format layer.
+* **Detect** — PII is detected with Presidio's default ``AnalyzerEngine`` (spaCy NER + its
+  built-in regex recognizers), restricted to the entity allow-list :data:`SCRUBBED_ENTITIES`
+  (what it covers, and why, is in its comment). Every detection on the allow-list is
+  replaced, at any score. Dates and times, URLs, organization names, UUIDs and any other
+  unlisted type pass as written. There is no declared-schema / identifier-format
+  layer.
 * **Replace** — each detected span is replaced with a **one-way keyed hash**
   (:func:`keyed_hash`) seeded by a fixed per-workspace **pseudonym key**
   (``.plurai/anon.key``, minted on first run, gitignored, never uploaded). Because the
@@ -23,8 +26,11 @@ Two steps, one keyed replacement:
 Ingested traces/RAG are used only to *learn* on — nothing downstream resolves a pseudonym
 against a live/mock system and nothing joins the same entity across records — so opaque
 ids (e.g. ``ACC_12345``, ``user_654``) are **not** treated as PII: they pass through
-unless a built-in recognizer flags them. The PII that matters (names, emails, phones,
-SSNs, addresses) is caught by Presidio either way.
+unless a built-in recognizer on the allow-list flags them. The PII that matters (names,
+emails, phones, SSNs, the city of an address) is caught by Presidio either way. Known
+residuals: NER tags some product or dish names as ``PERSON``, and the weak numeric recognizers
+flag some order/tracking numbers and SKUs; those stay hashed. The street line and postal code
+of an address pass.
 
 The pipeline is **fail-closed**: if Presidio or a spaCy model is not installed it raises
 (:class:`AnonymizationDependencyError`) rather than proceed.
@@ -79,12 +85,58 @@ KEY_BYTES = 32
 FINGERPRINT_LEN = 16
 #: Length of the free-text replacement token (hex chars of the keyed hash).
 FREE_TEXT_TOKEN_LEN = 16
+#: The Presidio entity types the scrub replaces, in every pipeline, with the same list for text, images and PDFs.
+#: Any entity type not listed is left as written. ``DATE_TIME``, ``URL`` and ``ORGANIZATION`` are left out on purpose:
+#: hashing them turned product facts (dispatch days, cook times, links, brand names) into hex tokens. ``LOCATION``
+#: stays because Presidio has no address entity, and ``NRP`` stays pending an owner decision. ``EMAIL``, ``ID`` and
+#: ``AGE`` are labels only a transformers NER model emits; the spaCy engine :func:`build_analyzer` builds lists them
+#: (Presidio's default label mapping) but never detects them. They are listed so a future engine switch stays covered.
+SCRUBBED_ENTITIES: tuple[str, ...] = (
+    'PERSON',
+    'EMAIL_ADDRESS',
+    'EMAIL',
+    'PHONE_NUMBER',
+    'CREDIT_CARD',
+    'IBAN_CODE',
+    'US_SSN',
+    'US_ITIN',
+    'US_PASSPORT',
+    'US_DRIVER_LICENSE',
+    'US_BANK_NUMBER',
+    'UK_NHS',
+    'MEDICAL_LICENSE',
+    'IP_ADDRESS',
+    'CRYPTO',
+    'MAC_ADDRESS',
+    'ID',
+    'AGE',
+    'LOCATION',
+    'NRP',
+)
+#: The allow-listed entity types the analyzer MUST report, or the anonymizer refuses to build (fail-closed): without
+#: them the scrub would silently stop covering names, contact details, places or the core government/card ids.
+REQUIRED_ENTITIES: tuple[str, ...] = ('PERSON', 'EMAIL_ADDRESS', 'PHONE_NUMBER', 'LOCATION', 'US_SSN', 'CREDIT_CARD')
+#: :data:`SCRUBBED_ENTITIES` in the customer's words, and what is sent as written: the pre-upload disclosure prints it.
+SCRUBBED_ENTITIES_DISCLOSURE = (
+    'person names, email addresses, phone numbers, card/IBAN/bank numbers, SSN/ITIN/passport/driver-license/'
+    'NHS/medical-license ids, IP and MAC addresses, crypto wallets, places (city/region/country), nationality/religion/'
+    'political group. Sent as written: dates and times (including dates of birth and ages), web addresses (including '
+    'any personal data in a query string), organization names, UUIDs, any other type not listed, and the street line '
+    'and postal code of an address.'
+)
+#: Set once the analyzer's unreported allow-listed types were logged, so a parallel run logs them once per process.
+_unreported_logged = False
 
 _MISSING_PRESIDIO_MSG = (
     'Anonymization requires Presidio, which is not installed. Ingestion is '
     'fail-closed and refuses to upload un-anonymized customer data. Install the '
     "optional extra: `pip install 'plurai-simulation-sdk[anonymize]'`, then download a spaCy "
     'English model, e.g. `python -m spacy download en_core_web_lg`.'
+)
+_MISSING_ENTITIES_MSG = (
+    'The installed Presidio analyzer does not detect {missing}. Ingestion is fail-closed and refuses to upload '
+    "data it cannot scrub. Reinstall the optional extra: `pip install 'plurai-simulation-sdk[anonymize]'`, then "
+    'download a spaCy English model, e.g. `python -m spacy download en_core_web_lg`.'
 )
 _MISSING_MODEL_MSG = (
     'Anonymization requires a spaCy English model, which is not installed. Ingestion '
@@ -286,6 +338,29 @@ def build_analyzer(*, model: str | None = None) -> Any:  # noqa: ANN401 - presid
     return presidio.AnalyzerEngine(nlp_engine=nlp_engine, supported_languages=['en'])
 
 
+def _scrubbed_entities(analyzer: Any) -> list[str]:  # noqa: ANN401 - presidio AnalyzerEngine (optional dep)
+    """:data:`SCRUBBED_ENTITIES` narrowed to the types ``analyzer`` reports: the ``entities`` every detection passes.
+
+    A type this Presidio release lacks is not requested (Presidio logs a warning per call for one); the ones left out
+    are logged once per process, by name. Raises :class:`AnonymizationDependencyError` (fail-closed) when any of
+    :data:`REQUIRED_ENTITIES` is not reported, so the list is never empty (an empty ``entities`` would make Presidio
+    run every recognizer).
+    """
+    global _unreported_logged
+    supported = set(analyzer.get_supported_entities(language='en'))
+    missing_required = [entity for entity in REQUIRED_ENTITIES if entity not in supported]
+    if missing_required:
+        raise AnonymizationDependencyError(_MISSING_ENTITIES_MSG.format(missing=', '.join(missing_required)))
+    kept: list[str] = []
+    unreported: list[str] = []
+    for entity in SCRUBBED_ENTITIES:
+        (kept if entity in supported else unreported).append(entity)
+    if unreported and not _unreported_logged:
+        _unreported_logged = True
+        logger.warning('anonymize: the analyzer does not report these allow-listed entity types: %s', ', '.join(unreported))
+    return kept
+
+
 def build_anonymizer() -> Any:  # noqa: ANN401 - presidio AnonymizerEngine (optional dep)
     """Build a fail-closed Presidio ``AnonymizerEngine``."""
     return _import_presidio().AnonymizerEngine()
@@ -370,21 +445,21 @@ def _strip_image_metadata(img: Any) -> bytes:  # noqa: ANN401 - PIL.Image.Image 
     return buf.getvalue()
 
 
-def _scrub_image(raw: bytes, redactor: Any, ir: SimpleNamespace, media: str) -> bytes:  # noqa: ANN401 - presidio ImageRedactorEngine (optional dep)
+def _scrub_image(raw: bytes, redactor: Any, ir: SimpleNamespace, media: str, entities: list[str]) -> bytes:  # noqa: ANN401 - presidio ImageRedactorEngine (optional dep)
     """OCR-redact PII regions in an image AND strip its metadata → bytes.
 
-    Opens the image, redacts detected PII (black fill) via the shared analyzer, then
-    re-encodes without metadata. Converting to RGB normalizes palette/grayscale/alpha
+    Opens the image, redacts detected PII of the given ``entities`` (black fill) via the shared
+    analyzer, then re-encodes without metadata. Converting to RGB normalizes palette/grayscale/alpha
     modes so the fill and re-encode are well-defined for every input.
     """
     with ir.Image.open(io.BytesIO(raw)) as opened:
         opened.load()  # force decode now so a truncated image raises here (fail-closed), not later
-        redacted = redactor.redact(opened.convert('RGB'), fill=(0, 0, 0), language='en')
+        redacted = redactor.redact(opened.convert('RGB'), fill=(0, 0, 0), language='en', entities=entities)
     redacted.format = 'PNG' if media == 'png' else 'JPEG'
     return _strip_image_metadata(redacted)
 
 
-def _scrub_pdf(raw: bytes, redactor: Any, ir: SimpleNamespace) -> bytes:  # noqa: ANN401 - presidio ImageRedactorEngine (optional dep)
+def _scrub_pdf(raw: bytes, redactor: Any, ir: SimpleNamespace, entities: list[str]) -> bytes:  # noqa: ANN401 - presidio ImageRedactorEngine (optional dep)
     """Rasterize each PDF page, OCR-redact it, and re-assemble an IMAGE-ONLY PDF → bytes.
 
     Rasterizing (dpi=250) then re-assembling from images DELIBERATELY discards the text
@@ -394,7 +469,7 @@ def _scrub_pdf(raw: bytes, redactor: Any, ir: SimpleNamespace) -> bytes:  # noqa
     pages = ir.convert_from_bytes(raw, dpi=250)
     if not pages:  # a valid-magic PDF that yields no pages is unusable → fail closed
         raise DocExampleBinaryError('PDF asset yielded no pages; refusing to egress un-scrubbed bytes (fail-closed).')
-    redacted = [redactor.redact(page.convert('RGB'), fill=(0, 0, 0), language='en') for page in pages]
+    redacted = [redactor.redact(page.convert('RGB'), fill=(0, 0, 0), language='en', entities=entities) for page in pages]
     buf = io.BytesIO()
     # Image-only PDF, carrying no doc-info/XMP beyond Pillow's creation timestamps.
     redacted[0].save(buf, format='PDF', save_all=True, append_images=redacted[1:])
@@ -492,6 +567,8 @@ class Anonymizer:
     ) -> None:
         self._key = key
         self._analyzer = analyzer
+        # The allow-list every detection passes, text and binary; fail-closed on a weak engine.
+        self._entities = _scrubbed_entities(analyzer)
         self._anonymizer = anonymizer
         self._kh_cache: dict[str, str] = {}
         self._key_cache: dict[str, str] = {}
@@ -551,13 +628,13 @@ class Anonymizer:
     def anonymize_value(self, value: Any) -> Any:  # noqa: ANN401 - JSON leaf of any type
         """Anonymize a single JSON string leaf; non-strings pass through unchanged.
 
-        Detects PII with Presidio (spaCy NER + built-in recognizers) and replaces each
-        detected span with a keyed hash. Text with no detected PII passes through
-        unchanged.
+        Detects PII with Presidio (spaCy NER + built-in recognizers), restricted to
+        :data:`SCRUBBED_ENTITIES`, and replaces each detected span with a keyed hash.
+        Text with no detected PII passes through unchanged.
         """
         if not isinstance(value, str) or not value:
             return value
-        results = self._analyzer.analyze(text=value, language='en')
+        results = self._analyzer.analyze(text=value, language='en', entities=self._entities)
         if not results:
             return value
         return self._anonymizer.anonymize(text=value, analyzer_results=results, operators=self._operators).text
@@ -663,8 +740,8 @@ class Anonymizer:
             self._image_redactor = ir.ImageRedactorEngine(image_analyzer_engine=image_analyzer)
         try:
             if media == 'pdf':
-                return _scrub_pdf(raw, self._image_redactor, ir)
-            return _scrub_image(raw, self._image_redactor, ir, media)
+                return _scrub_pdf(raw, self._image_redactor, ir, self._entities)
+            return _scrub_image(raw, self._image_redactor, ir, media, self._entities)
         except DocExampleBinaryError:
             raise  # already the fail-closed error (e.g. a page-less PDF) — do not re-wrap
         except ir.missing_binary_errors as e:  # Tesseract/Poppler absent at call time (matched FIRST)
@@ -753,6 +830,7 @@ def anonymize_files(paths: Iterable[str | Path], spec: AnonymizerSpec, *, max_wo
 
 __all__ = [
     'FINGERPRINT_LEN',
+    'SCRUBBED_ENTITIES',
     'AnonymizationDependencyError',
     'Anonymizer',
     'AnonymizerSpec',

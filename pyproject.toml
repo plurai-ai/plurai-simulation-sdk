@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "plurai-simulation-sdk"
-version = "1.0.1"
+version = "1.0.2"
 description = "Simulate conversations against your AI agent and score it on your policies."
 readme = "README.md"
 license = {text = "Proprietary"}
