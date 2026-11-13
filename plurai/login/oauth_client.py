@@ -61,7 +61,7 @@ from plurai import _platform, credentials
 from plurai.login import _pages
 
 #: How long the user has to sign in and consent.
-DEFAULT_CONSENT_TIMEOUT: Final = 300.0
+DEFAULT_CONSENT_TIMEOUT: Final = 3600.0
 #: The limit of each request to the authorization server.
 DEFAULT_HTTP_TIMEOUT: Final = 10.0
 #: How long the browser's callback request waits for :meth:`Authorization.respond` before it gets the failure page.
