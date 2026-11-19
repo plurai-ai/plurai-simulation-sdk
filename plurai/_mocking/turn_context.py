@@ -309,6 +309,11 @@ def last_cli_query() -> CliQueryStart | None:
     return _cli_queries_started[-1] if _cli_queries_started else None
 
 
+def peek_cli_queries() -> list[CliQueryStart]:
+    """Every query the CLI started since the last take, oldest first. Read, not taken."""
+    return list(_cli_queries_started)
+
+
 def cli_query_end(prompt_id: str) -> CliStop | None:
     """How the query ``prompt_id`` ended, if its end was recorded since the last take. Read, not taken."""
     return next((stop for stop in reversed(_cli_stops) if stop.prompt_id == prompt_id), None)

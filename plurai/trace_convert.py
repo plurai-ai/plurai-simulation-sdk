@@ -137,6 +137,7 @@ from plurai.gates.catalogue import (
     TRACE_SEED_SHAPE_REFUSED,
 )
 from plurai import readers
+from plurai.content_parts import document_part_values, part_text
 from plurai.gates.contract import GateFinding
 from plurai.ingest.posture import resolve_posture
 from plurai.ingest.workspace_config import CONFIG_CANDIDATE_RELPATHS
@@ -1947,6 +1948,45 @@ def _run_identity(metadata: Mapping[str, Any], key: str, *, source: str) -> str:
     )
 
 
+def _run_user_content(turn: Mapping[str, Any], user_message: str) -> str | list[Any]:
+    """What a run turn's user side pins as: its recorded parts when they carry a document, else its text.
+
+    ``user_message`` is the turn's STRING projection, which renders a handed-over file as a
+    ``[file: name]`` marker and drops its bytes; ``turns[i].user_messages`` beside it is the parts
+    list the backend actually sent. Pinning the projection would replay a conversation
+    in which the user named a document and never handed it over. Only a turn whose parts carry a
+    document reads them, so a text-only turn, and a turn whose parts are text alone, pins the turn's
+    string.
+    """
+    parts = turn.get('user_messages')
+    if isinstance(parts, list) and document_part_values(parts):
+        return parts
+    return user_message
+
+
+def _pinned_document_references(messages: Sequence[ResumePinMessage]) -> list[str]:
+    """Every document value on a HUMAN message that is not carried inline as a ``data:`` URI, in order.
+
+    A run's converter pins only what the backend sent, and a ``data:`` value is the document
+    itself. Anything else (a ``plurai:///documents/…`` reference above all) names a file in the
+    SOURCE run's set: a replay would read across sets, and break once that set is deleted. Human
+    messages only, because an agent's reply that shows an http image is not a handed-over document.
+    """
+    return [
+        value for message in messages if isinstance(message, HumanPinMessage) for value in document_part_values(message.content) if value[:5].lower() != 'data:'
+    ]
+
+
+#: Longest reference value quoted in the refusal; a URL past it is cut, since naming it is the point.
+_REFERENCE_DISPLAY_MAX_CHARS = 120
+
+
+def _reference_display(value: str) -> str:
+    """One reference as the refusal names it: escaped like a provenance value, and cut past :data:`_REFERENCE_DISPLAY_MAX_CHARS`."""
+    shown = value if len(value) <= _REFERENCE_DISPLAY_MAX_CHARS else value[: _REFERENCE_DISPLAY_MAX_CHARS - 1] + '…'
+    return f'`{_provenance_display(shown)}`'
+
+
 def _plurai_run_front_end(source_path: Path) -> SourceProjection:
     """A simulation run's per-scenario ``transcript.json`` → its source-shaped projection.
 
@@ -1961,7 +2001,8 @@ def _plurai_run_front_end(source_path: Path) -> SourceProjection:
     ``chatbot_messages`` arrays cannot reconstruct without re-deriving the pairing by position.
     Each user message is emitted exactly once even though the record carries it twice: a turn's
     ``output_user_message`` is the NEXT turn's ``user_message``, and the closing turn's
-    ``user_message`` is the last one already said, so only ``user_message`` is read.
+    ``user_message`` is the last one already said, so only ``user_message`` is read — or, on a
+    turn that handed over a document, the parts list recorded beside it (:func:`_run_user_content`).
 
     The user side of a transcript records no ids — nothing in a run needs them — and a harness may
     return the agent's messages without one, so every message a turn records with no id, or a
@@ -2070,7 +2111,7 @@ def _plurai_run_front_end(source_path: Path) -> SourceProjection:
                 'side is not that conversation.'
             )
         chain = _fold_tool_trail(_run_turn_chain(turn, where=where), turn.get('agent_state'), where=where, known_call_ids=issued | seed_trail_ids)
-        for at, message in ((where, {'type': 'human', 'content': user_message}), *chain):
+        for at, message in ((where, {'type': 'human', 'content': _run_user_content(turn, user_message)}), *chain):
             calls, answer = _exchange_ids(message)
             # Only an id the recording lacks (absent, null or blank) is filled. One that is present
             # but not a string is a malformed recording, left for `canonical_message` to refuse
@@ -2409,6 +2450,21 @@ def _convert_one(
         messages, trim_record = _apply_trim(
             canonical, source=source, trim=trim_mid_turn_tail, cut_turn=cut_turn, resume_seed_messages=projection.resume_seed_messages
         )
+    # The backstop for a run's carried documents: after the cut and the trim, so it judges
+    # only what the pin keeps, and only on the user's own messages — an agent's reply may cite a URL.
+    if spec.name == 'plurai-run' and (references := _pinned_document_references(messages)):
+        raise ThreadRefused(
+            _thread_finding_unrepresentable(
+                source,
+                spec.name,
+                'message',
+                f'{source}: a user message the pin would keep hands over {len(references)} document(s) served by reference '
+                f'({", ".join(sorted({_reference_display(value) for value in references}))}), not carried inline. A reference '
+                "names a file in the source run's document set, so the replay would read another set's file, and lose it "
+                'once that set is deleted. Cut before the turn that handed it over, or record a scenario whose document '
+                'was carried inline.',
+            )
+        )
 
     # Validated from a mapping rather than called with keywords: everything past `thread_id` is an
     # EXTRA on the pin's one open shape, so these are keys, not fields — which is also how
@@ -2585,8 +2641,24 @@ def _render_content(content: Any) -> str:
     if isinstance(content, str):
         return content
     if isinstance(content, list):
-        parts = [block.get('text', '') if isinstance(block, dict) else str(block) for block in content]
-        return ''.join(p for p in parts if p)
+        # A ``file`` part is named on a line of its own, the way ``content_parts.render_parts`` names
+        # it, and never shows its bytes: a pinned turn that handed over a document still
+        # reads as one in the prose. A text-only list renders as its text blocks concatenated.
+        segments: list[str] = []
+        run: list[str] = []
+        for block in content:
+            if isinstance(block, dict) and block.get('type') == 'file':
+                if run:
+                    segments.append(''.join(run))
+                    run = []
+                segments.append(part_text(block) or '[file]')
+                continue
+            text = block.get('text', '') if isinstance(block, dict) else str(block)
+            if text:
+                run.append(text)
+        if run:
+            segments.append(''.join(run))
+        return '\n'.join(segments)
     return json.dumps(content, ensure_ascii=False)
 
 

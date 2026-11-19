@@ -234,6 +234,8 @@ class ChildProcess:
         self.world_values_coerced: dict[str, str] | None = None
         # The interception files the agent changed (``FinalizeResponse.interception_changed``), set by :meth:`finalize`.
         self.interception_changed: list[str] | None = None
+        # ``FinalizeResponse.clock_delivery`` (see plurai.clock), set by :meth:`finalize`.
+        self.clock_delivery: str | None = None
         # The harness's ``agent.io`` declaration, read at most once and only when a turn needs
         # it — see ``_declared_io``.
         self._agent_io: AgentIO | None = None
@@ -642,6 +644,7 @@ class ChildProcess:
             self.unread_parts = response.unread_parts
             self.world_values_coerced = response.world_values_coerced
             self.interception_changed = response.interception_changed
+            self.clock_delivery = response.clock_delivery
             return response.final_world_state, response.tool_events, response.unanswered_mock_calls, bool(response.capture_retryable)
         if isinstance(response, AgentError):
             # The event log held a fault this process never saw (a call the agent's spawned process made).

@@ -15,21 +15,38 @@ token's value is redacted from everything the SDK writes (:func:`plurai.host_eff
 absent from the parent environment is simply not set. A malformed declaration, or one that names a
 backend token variable, is an error: a declaration that cannot testify never degrades to "nothing
 declared".
+
+The root key is the canonical spelling. The same list written nested, ``agent: {env: [...]}``, is read too
+(unioned after the root list) and reported (:func:`misplaced_agent_keys`, one warning per config file), so
+the run is correct and the config still moves to the root key. A malformed nested list is reported and
+ignored, never refused: none of its names reaches the agent.
 """
 
 from __future__ import annotations
 
+import logging
 import os
 import re
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Iterator, Mapping
+from dataclasses import dataclass
 from pathlib import Path
+from typing import cast
 
 from plurai._endpoints import TOKEN_ENV, URL_ENV
 from plurai.host_effects import BACKEND_TOKEN_ENV, CLI_CREDENTIAL_ENV, CLI_SECRET_ENV
 from plurai.ingest.workspace_config import CONFIG_FILENAME, WorkspaceConfigError, bench_config_roots, discover_config_documents
 
+logger = logging.getLogger(__name__)
+
 #: Top-level ``plurai.config.yaml`` key: the variable names the agent needs from the launching environment.
 AGENT_ENV_KEY = 'agent.env'
+
+#: The ``agent:`` block and the ``env:`` key a nested declaration is written as: ``agent: {env: [...]}``.
+_AGENT_KEY = 'agent'
+_NESTED_ENV_KEY = 'env'
+
+#: How the nested spelling is named in findings and warnings.
+NESTED_AGENT_ENV = 'agent: {env: …}'
 
 #: What a process needs to run: its search paths and interpreter, locale and time zone, home and temp
 #: folders, TLS roots and the proxy settings of the network it sits behind (spelled in both cases).
@@ -110,6 +127,48 @@ class AgentEnvConfigError(WorkspaceConfigError):
     """``agent.env`` exists but cannot testify to a list of variable names (fail closed)."""
 
 
+@dataclass(frozen=True, slots=True)
+class MisplacedAgentKey:
+    """A nested ``agent: {env: …}`` in one config file: read as :data:`AGENT_ENV_KEY`, or ignored as malformed."""
+
+    #: The spelling found (:data:`NESTED_AGENT_ENV`).
+    key: str
+    #: The key it was read as; ``None`` when it was ignored.
+    read_as: str | None
+    #: Why it was ignored; ``None`` when it was read.
+    defect: str | None
+    source: Path
+
+
+def _env_list_defect(raw: object) -> str | None:
+    """Why ``raw`` is not a list of variable names the agent may ask for; ``None`` when it is."""
+    if not isinstance(raw, list):
+        return f'must be a list of environment variable names, got {type(raw).__name__}.'
+    for name in raw:
+        if not isinstance(name, str) or not _VARIABLE_NAME.fullmatch(name):
+            return f'lists {name!r}, which is not an environment variable name.'
+        if name in BACKEND_TOKEN_ENV:
+            return (
+                f'lists {name}. The backend token reaches the agent only as {TOKEN_ENV}, passed on by the runner; it is not a variable the agent can ask for.'
+            )
+    return None
+
+
+def _nested_env(document: Mapping[str, object]) -> tuple[tuple[str, ...], str | None] | None:
+    """The nested ``agent: {env: …}`` list as ``(names, defect)``; ``None`` when ``document`` has none.
+
+    THE one reader of the nested spelling, so the names the child gets and the defect the run reports never
+    disagree. A malformed list yields no names at all, not its well-formed part.
+    """
+    agent = document.get(_AGENT_KEY)
+    if not isinstance(agent, Mapping) or _NESTED_ENV_KEY not in agent:
+        return None
+    raw = agent[_NESTED_ENV_KEY]
+    if (defect := _env_list_defect(raw)) is not None:
+        return (), defect
+    return tuple(dict.fromkeys(cast('list[str]', raw))), None
+
+
 def _inherited(name: str) -> bool:
     if name in BACKEND_TOKEN_ENV:
         return False
@@ -147,35 +206,87 @@ def child_environment(
 
 
 def parse_declared_env(document: Mapping[str, object], *, source: Path | None = None) -> tuple[str, ...]:
-    """The names ``document`` declares under :data:`AGENT_ENV_KEY`; empty when it does not declare the key."""
-    if AGENT_ENV_KEY not in document:
-        return ()
-    where = f'`{AGENT_ENV_KEY}` in {source or CONFIG_FILENAME}'
-    raw = document[AGENT_ENV_KEY]
-    if not isinstance(raw, list):
-        raise AgentEnvConfigError(f'{where} must be a list of environment variable names, got {type(raw).__name__}.')
-    for name in raw:
-        if not isinstance(name, str) or not _VARIABLE_NAME.fullmatch(name):
-            raise AgentEnvConfigError(f'{where} lists {name!r}, which is not an environment variable name.')
-        if name in BACKEND_TOKEN_ENV:
-            raise AgentEnvConfigError(
-                f'{where} lists {name}. The backend token reaches the agent only as {TOKEN_ENV}, passed on by the runner; '
-                'it is not a variable the agent can ask for.'
-            )
-    return tuple(dict.fromkeys(raw))
+    """The names ``document`` declares: :data:`AGENT_ENV_KEY`, then a well-formed nested ``agent: {env: …}``.
+
+    A malformed root key raises :class:`AgentEnvConfigError`; a malformed nested list adds nothing (it is
+    reported by :func:`misplaced_agent_keys`). Empty when neither is declared.
+    """
+    names: tuple[str, ...] = ()
+    if AGENT_ENV_KEY in document:
+        raw = document[AGENT_ENV_KEY]
+        if (defect := _env_list_defect(raw)) is not None:
+            raise AgentEnvConfigError(f'`{AGENT_ENV_KEY}` in {source or CONFIG_FILENAME} {defect}')
+        names = tuple(cast('list[str]', raw))
+    if (nested := _nested_env(document)) is not None:
+        names += nested[0]
+    return tuple(dict.fromkeys(names))
 
 
-def declared_env(simulate_path: Path | str) -> tuple[str, ...]:
-    """The variable names declared beside ``simulate_path`` (its directory and the root above it)."""
+def _config_documents(simulate_path: Path | str) -> Iterator[tuple[Path, Mapping[str, object]]]:
+    """Each config document beside ``simulate_path`` (its directory and the root above it), once per file."""
     seen: set[Path] = set()
-    names: list[str] = []
     for root in bench_config_roots(Path(simulate_path)):
         for path, document in discover_config_documents(root, error=AgentEnvConfigError):
             resolved = path.resolve()
             if resolved not in seen:
                 seen.add(resolved)
-                names.extend(parse_declared_env(document, source=path))
+                yield path, document
+
+
+#: Config files whose nested ``agent: {env: …}`` this process already warned about.
+_WARNED_NESTED: set[Path] = set()
+
+
+def _warn_nested_once(path: Path, nested: tuple[tuple[str, ...], str | None]) -> None:
+    resolved = path.resolve()
+    if resolved in _WARNED_NESTED:
+        return
+    _WARNED_NESTED.add(resolved)
+    names, defect = nested
+    if defect is None:
+        logger.warning(
+            '%s: `%s` is read as the root key `%s` (%s). Move the list to the root of %s, written `%s:` beside `agent.io:`.',
+            path,
+            NESTED_AGENT_ENV,
+            AGENT_ENV_KEY,
+            ', '.join(names) or 'no names',
+            CONFIG_FILENAME,
+            AGENT_ENV_KEY,
+        )
+    else:
+        logger.warning(
+            '%s: `%s` %s None of its names reaches the agent. Write it as the root key `%s: [NAME, …]`.',
+            path,
+            NESTED_AGENT_ENV,
+            defect,
+            AGENT_ENV_KEY,
+        )
+
+
+def declared_env(simulate_path: Path | str) -> tuple[str, ...]:
+    """The variable names declared beside ``simulate_path`` (its directory and the root above it).
+
+    A nested ``agent: {env: …}`` is read with the root key and warned about once per config file.
+    """
+    names: list[str] = []
+    for path, document in _config_documents(simulate_path):
+        names.extend(parse_declared_env(document, source=path))
+        if (nested := _nested_env(document)) is not None:
+            _warn_nested_once(path, nested)
     return tuple(dict.fromkeys(names))
+
+
+def misplaced_agent_keys(simulate_path: Path | str) -> tuple[MisplacedAgentKey, ...]:
+    """Each nested ``agent: {env: …}`` beside ``simulate_path``: read as :data:`AGENT_ENV_KEY`, or ignored as malformed.
+
+    Raises :class:`AgentEnvConfigError` when a config file cannot be read at all, as :func:`declared_env` does.
+    """
+    out: list[MisplacedAgentKey] = []
+    for path, document in _config_documents(simulate_path):
+        if (nested := _nested_env(document)) is not None:
+            _, defect = nested
+            out.append(MisplacedAgentKey(key=NESTED_AGENT_ENV, read_as=None if defect else AGENT_ENV_KEY, defect=defect, source=path))
+    return tuple(out)
 
 
 def launch_environment(
@@ -189,9 +300,12 @@ __all__ = [
     'AGENT_ENV_KEY',
     'ALLOWLIST_NAMES',
     'ALLOWLIST_PREFIXES',
+    'NESTED_AGENT_ENV',
     'AgentEnvConfigError',
+    'MisplacedAgentKey',
     'child_environment',
     'declared_env',
     'launch_environment',
+    'misplaced_agent_keys',
     'parse_declared_env',
 ]

@@ -855,6 +855,15 @@ class FinalizeRequest(BaseModel):
     run). A fact, not a verdict: the server joins it with the scenario's declared channels, and an
     unread key no other channel carries is an ``undelivered_input`` breach. ``None`` = not recorded.
 
+    ``clock_delivery`` is the client's DELIVERY RECORD for the scenario's run clock: the route by which
+    the harness gave the agent the run date — ``pinned`` (the agent's clock name rebound to it),
+    ``store`` (written into the store the agent reads its date from) or ``told`` (put into the agent's
+    own input). ``None`` = no delivery was recorded; a read of the clock key is not a delivery. A
+    recorded route lets the judges grade the agent's dates against the run date; anything else (``None``,
+    absent, an unknown string, which is logged) is read as nothing recorded, and a scenario that declares
+    a clock then carries a ``clock_undelivered`` block in ``policy_evaluation_results``. A plain ``str``
+    for the same additive-skew reason as ``ended_early``.
+
     ``post_seed_world_state`` is the client's read of the WHOLE world right after the harness's
     ``seed_state`` (every entity type, in the ``final_world_state`` shape). It is the world the run
     started from: a row the harness seeded itself (a handed-over document written from the agent's
@@ -871,6 +880,7 @@ class FinalizeRequest(BaseModel):
         extra='ignore',
     )
     chatbot_messages: Annotated[list[SerializedMessage] | None, Field(title='Chatbot Messages')] = None
+    clock_delivery: Annotated[str | None, Field(title='Clock Delivery')] = None
     closing_agent_actions: Annotated[list[AgentAction] | None, Field(title='Closing Agent Actions')] = None
     closing_agent_response: Annotated[str | None, Field(title='Closing Agent Response')] = None
     closing_agent_state: Annotated[dict[str, Any] | None, Field(title='Closing Agent State')] = None

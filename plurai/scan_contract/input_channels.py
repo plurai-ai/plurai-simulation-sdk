@@ -39,8 +39,16 @@ SCHEDULE_OF_KIND: Mapping[ChannelKind, Literal['turn_inputs', 'between_turn_acti
 )
 
 
+#: The ROOT ``plurai.config.yaml`` key the channels are declared under: its name contains a literal dot.
+AGENT_IO_KEY = 'agent.io'
+#: The keys a CONFIG channel entry must carry as non-blank strings.
+_CONFIG_CHANNEL_REQUIRED = ('name', 'kind', 'field', 'source')
+#: The ``agent.io`` sub-keys the SDK reads (``plurai.agent_io._KNOWN_FIELDS``); any other is a field it ignores.
+AGENT_IO_FIELDS = ('input', 'may_open', 'opens', 'choice_text', 'choice_text_source', 'channels')
+
+
 class MalformedInputChannelError(ValueError):
-    """A declared ``agent.io.channels`` entry that is not ``{name, kind}`` with a contract kind, or a duplicate name."""
+    """A declared channel or ``agent.io`` declaration that cannot be read; the cases are listed on :func:`declared_channels`."""
 
 
 @dataclass(frozen=True)
@@ -58,48 +66,144 @@ class InputChannel:
 def channel_from_wire(raw: Any) -> InputChannel:
     """One ``{name, kind, field?}`` mapping as an :class:`InputChannel`. RAISES :class:`MalformedInputChannelError`."""
     if not isinstance(raw, Mapping):
-        raise MalformedInputChannelError(f'agent.io.channels entry {raw!r} is not a mapping with `name` and `kind`')
+        raise MalformedInputChannelError(f'carried input_channels entry {raw!r} is not a mapping with `name` and `kind`')
     name = str(raw.get('name') or '').strip()
     kind = str(raw.get('kind') or '').strip().lower()
     if not name:
-        raise MalformedInputChannelError(f'agent.io.channels entry {dict(raw)!r} names no channel')
+        raise MalformedInputChannelError(f'carried input_channels entry {dict(raw)!r} names no channel')
     if kind not in CHANNEL_KINDS:
-        raise MalformedInputChannelError(f'agent.io.channels.{name}.kind {raw.get("kind")!r} is not one of {list(CHANNEL_KINDS)}')
+        raise MalformedInputChannelError(f'carried input_channels entry `{name}`: kind {raw.get("kind")!r} is not one of {list(CHANNEL_KINDS)}')
     return InputChannel(name=name, kind=kind, field=str(raw.get('field') or '').strip())  # type: ignore[arg-type]  # narrowed by the membership test
 
 
 def channels_from_wire(entries: Any) -> tuple[InputChannel, ...]:
-    """A list of channel mappings (the job's carried copy, or the config's block), validated, in order."""
+    """The job's CARRIED channel copy (:meth:`InputChannel.to_wire` mappings, as held in job inputs, graph state and the
+    redrive contract), validated, in order. Lenient on purpose: that copy has no ``source``/``handover``, and its kind
+    is lowercased. The strict read of the customer's config is :func:`declared_channels`.
+    """
     if entries is None:
         return ()
     if not isinstance(entries, list):
-        raise MalformedInputChannelError(f'agent.io.channels is a {type(entries).__name__}, not a list of channel entries')
+        raise MalformedInputChannelError(f'carried input_channels is a {type(entries).__name__}, not a list of channel entries')
     out: list[InputChannel] = []
     for entry in entries:
         channel = channel_from_wire(entry)
         if any(seen.name == channel.name for seen in out):
-            raise MalformedInputChannelError(f'agent.io.channels declares `{channel.name}` twice')
+            raise MalformedInputChannelError(f'carried input_channels names `{channel.name}` twice')
         out.append(channel)
     return tuple(out)
 
 
 def declared_channels(plurai_config_yaml: str | None) -> tuple[InputChannel, ...]:
-    """Every ``agent.io.channels`` entry, in config order. Empty for an absent or unparseable config, or one that
-    declares none.
+    """Every ``agent.io.channels`` entry of a ``plurai.config.yaml``, in config order: the STRICT config read.
 
-    RAISES :class:`MalformedInputChannelError` for an entry outside the contract: a channel no scenario could be
-    checked against is refused, never dropped.
+    Read from the ROOT key ``agent.io`` (a literal dot, beside ``workspace:``), the spelling the SDK requires. ``()`` for
+    an absent, blank or comments-only config, a config with no ``agent.io`` (or ``agent.io:`` null), and an ``agent.io``
+    with no ``channels:``.
+
+    RAISES :class:`MalformedInputChannelError` (each message names its fix), never reading the config as declaring
+    none, for:
+
+    * a config that does not parse, or whose top level is not a mapping;
+    * the nested ``agent: {io: …}`` form, including a document that also carries the root ``agent.io:``;
+    * an ``agent.io`` that is not a mapping;
+    * a ``channels`` that is not a list, or an entry that is not a mapping, lacks a non-blank string
+      ``name``/``kind``/``field``/``source``, has a ``kind`` outside :data:`CHANNEL_KINDS` (case-sensitive), a
+      non-string ``handover``, or repeats a name.
+
+    Values are compared after trimming whitespace. An ``agent.io`` sub-key the SDK does not read is not refused here:
+    :func:`agent_io_field_warnings` names it.
     """
+    io = _agent_io_block(plurai_config_yaml)
+    return _config_channels(io) if io is not None else ()
+
+
+def agent_io_field_warnings(plurai_config_yaml: str | None) -> list[str]:
+    """One warning per ``agent.io`` sub-key the SDK does not read (it records them as ``unknown_field`` and ignores
+    them), naming the known ones: a misspelled ``channels:`` declares nothing. Never raises: an unreadable config is
+    :func:`declared_channels`' to refuse.
+    """
+    if not plurai_config_yaml or AGENT_IO_KEY not in plurai_config_yaml:
+        return []
+    try:
+        io = _agent_io_block(plurai_config_yaml)
+    except MalformedInputChannelError:
+        return []
+    known = ', '.join(AGENT_IO_FIELDS)
+    return [
+        f'`{AGENT_IO_KEY}.{key}` is not a field the SDK reads (known: {known}); a misspelled `channels:` declares nothing.'
+        for key in sorted(set(map(str, io or {})) - set(AGENT_IO_FIELDS))
+    ]
+
+
+def _agent_io_block(plurai_config_yaml: str | None) -> dict[str, Any] | None:
+    """The config's ROOT ``agent.io`` mapping, or ``None`` when it declares none. RAISES as :func:`declared_channels`."""
     import yaml  # noqa: PLC0415
 
     from plurai.scan_contract._safe_yaml import safe_yaml_load  # noqa: PLC0415
 
     if not plurai_config_yaml or not plurai_config_yaml.strip():
-        return ()
+        return None
     try:
         raw = safe_yaml_load(plurai_config_yaml)
-    except yaml.YAMLError:
+    except yaml.YAMLError as exc:
+        raise MalformedInputChannelError(
+            f'plurai.config.yaml does not parse, so its {AGENT_IO_KEY} channels cannot be read: {exc}. Fix the YAML syntax at that line/column.'
+        ) from exc
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise MalformedInputChannelError(
+            f'plurai.config.yaml must be a YAML mapping to declare anything; got {type(raw).__name__}. Write it as `key: value` lines at the root.'
+        )
+    agent = raw.get('agent')
+    if isinstance(agent, Mapping) and 'io' in agent:
+        raise MalformedInputChannelError(
+            f'`agent: {{io: …}}` declares nothing: only the ROOT key `{AGENT_IO_KEY}:` (a literal dot, beside `workspace:`) is read. '
+            f'Move the block to the root of plurai.config.yaml (or delete it, if a root `{AGENT_IO_KEY}:` already holds the declaration).'
+        )
+    io = raw.get(AGENT_IO_KEY)
+    if io is None:
+        return None
+    if not isinstance(io, dict):
+        raise MalformedInputChannelError(
+            f'`{AGENT_IO_KEY}` must be a mapping declaring `channels:`, `input:` and/or `may_open:`, got {type(io).__name__}. '
+            'Omit the key when the agent declares none of them.'
+        )
+    return io
+
+
+def _config_channels(io: Mapping[str, Any]) -> tuple[InputChannel, ...]:
+    """``agent.io.channels`` held to the SDK's own read (``plurai.agent_io._parse_channels``). An unknown key in an entry
+    is ignored (the SDK reports it as a defect, never refuses it)."""
+    if 'channels' not in io:
         return ()
-    agent = raw.get('agent') if isinstance(raw, dict) else None
-    io = agent.get('io') if isinstance(agent, dict) else None
-    return channels_from_wire(io.get('channels') if isinstance(io, dict) else None)
+    declared = io['channels']
+    entry_shape = '{name, kind, field, source, handover}'
+    if not isinstance(declared, list):
+        raise MalformedInputChannelError(
+            f'`{AGENT_IO_KEY}.channels` must be a list of {entry_shape} entries, got {type(declared).__name__}. '
+            'Write one `- {name: …, kind: …, field: …, source: …}` item per channel, or drop the key.'
+        )
+    out: list[InputChannel] = []
+    for index, entry in enumerate(declared):
+        key = f'{AGENT_IO_KEY}.channels[{index}]'
+        if not isinstance(entry, Mapping):
+            raise MalformedInputChannelError(f'`{key}` must be a mapping {entry_shape}, got {type(entry).__name__}. Rewrite it as one.')
+        for required in _CONFIG_CHANNEL_REQUIRED:
+            value = entry.get(required)
+            if not isinstance(value, str) or not value.strip():
+                raise MalformedInputChannelError(f'`{key}.{required}` must be a non-blank string, got {value!r}. Set it (re-run the scan).')
+        kind = entry['kind'].strip()
+        if kind not in CHANNEL_KINDS:
+            raise MalformedInputChannelError(f'`{key}.kind` must be one of {list(CHANNEL_KINDS)}, got {kind!r}. Use one of them, spelled exactly.')
+        handover = entry.get('handover')
+        if handover is not None and not isinstance(handover, str):
+            raise MalformedInputChannelError(f'`{key}.handover` must be a string when set, got {handover!r}. Quote it as text, or drop it.')
+        name = entry['name'].strip()
+        if any(seen.name == name for seen in out):
+            raise MalformedInputChannelError(
+                f'`{AGENT_IO_KEY}.channels` declares the channel {name!r} more than once: scenarios address a channel by name. Rename or merge the duplicates.'
+            )
+        out.append(InputChannel(name=name, kind=kind, field=entry['field'].strip()))  # type: ignore[arg-type]  # narrowed by the membership test
+    return tuple(out)

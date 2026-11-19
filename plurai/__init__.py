@@ -39,6 +39,7 @@ if _typing.TYPE_CHECKING:
         world_state_snapshot,
     )
     from plurai._protocol import AgentFault, HarnessFault
+    from plurai.clock import clock_delivered, pin_now
     from plurai.file_rows import file_row
     from plurai.host_effects import cli_hooks, confine, host_effects_granted, host_read_scope
     from plurai.input_context import model_input_context
@@ -75,6 +76,8 @@ __all__ = [
     'file_row',
     'store_record',
     'model_input_context',
+    'clock_delivered',
+    'pin_now',
     # Faults a harness or an agent reports
     'HarnessFault',
     'AgentFault',

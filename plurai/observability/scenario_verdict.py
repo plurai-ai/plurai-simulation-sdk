@@ -49,7 +49,9 @@ GOAL_SOURCE_NONE: Final = 'none'
 #: The goal owners the backend declares today. NOT a gate: an unrecognized source still names an
 #: owner, so it stays measurable — it is REPORTED by name in :attr:`ScenarioVerdict.note` (and
 #: from there into every sink comment) rather than silently swallowed or silently trusted.
-KNOWN_GOAL_SOURCES: Final = frozenset({'deterministic', 'target_judge', GOAL_SOURCE_NONE, 'pipeline_error', 'agent_closed'})
+KNOWN_GOAL_SOURCES: Final = frozenset(
+    {'deterministic', 'target_judge', GOAL_SOURCE_NONE, 'pipeline_error', 'pipeline_collapse', 'agent_closed', 'agent_fault_give_up'}
+)
 
 #: OPTIONAL block key the backend sets when the situation a scenario's target is written against never arose,
 #: so neither axis decided the goal. Absent on every other row.

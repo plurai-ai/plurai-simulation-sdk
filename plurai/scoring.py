@@ -22,6 +22,8 @@ CONVERSATION (one trial attempt of one scenario).
   the goal owners — ``goal.target_judge_owners`` — are the goal axis, not this one), ``goal_missed``
   (``goal.goal_achieved`` is false; null is the status ``goal_undecided``, scored normally), ``crashed`` (status
   ``agent_error``: scored 0, its cells still name any critical failure).
+  The backend decides an undecided goal false when the agent's own close or an agent-fault give-up ended the dialog
+  before the target arose, so such a row reaches here as ``goal_missed``.
 * Status ``harness_error`` and ``incomplete`` are left out: ``result: not_scored``, no score, nothing counted.
 * A critical eval that is no longer ``fail`` is RELEASED only when the history entry that moved it out of ``fail``
   is a red-cell audit ``FALSE_RED`` row with a typed cause (false positive: rubric/type/prompt/target_clause; test

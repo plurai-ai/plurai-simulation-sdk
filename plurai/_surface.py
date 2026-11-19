@@ -68,6 +68,7 @@ HOMES: dict[str, tuple[str, ...]] = {
     'plurai.file_rows': ('file_row',),
     'plurai.world.seed_rows': ('store_record',),
     'plurai.input_context': ('model_input_context',),
+    'plurai.clock': ('clock_delivered', 'pin_now'),
 }
 
 #: Name -> the module that provides it.

@@ -251,6 +251,7 @@ from plurai.orchestrator.orchestrator import (
     _declared_world_slots,
     _finalize_error_message,
     _module_scope_bindings_of_file,
+    agent_key_findings,
     contradicted_shape_declaration,
     reset_warning_ledgers,
     shared_world_risk,
@@ -5520,6 +5521,8 @@ def _write_success_artifacts(
                 'initial_agent_context': result.initial_agent_context,
                 # The keys of it the harness never read (``None`` = not recorded) — the re-score's input.
                 'unread_inputs': result.unread_inputs,
+                # see plurai.clock — the re-score's clock route.
+                'clock_delivery': result.clock_delivery,
                 # The world right after ``seed_state`` (``None`` = not read) — the re-score's start world.
                 'post_seed_world_state': result.post_seed_world_state,
                 'resume_seed_present': result.resume_seed is not None,
@@ -12900,6 +12903,12 @@ def _main_body(args: argparse.Namespace) -> int:
                 draft_ref=None,
             )
         )
+    # THE AGENT'S ENVIRONMENT DECLARATION written nested (`agent: {env: …}`): read as `agent.env`, or ignored
+    # when malformed. Advisory — it never stops the run, so a config that cannot be read is left to the launch
+    # path, which raises on it.
+    with suppress(WorkspaceConfigError):
+        for finding in agent_key_findings(cfg.agent_module_path):
+            gates.emit(finding)
     # THE TURN-INPUT SURFACE, AFTER the world rung on purpose — the error class it raises also covers
     # "the config could not be read at all", whose posture is decided above. Unknown words are findings
     # (an unknown sub-key holds); a malformed value of a known key is invariant.

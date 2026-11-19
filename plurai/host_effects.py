@@ -1341,14 +1341,196 @@ def _operator_credential_store(cli_env: Mapping[str, str]) -> str:
     return cli_env.get('CLAUDE_CONFIG_DIR') or ''
 
 
-def _trail_recorder(trail: list[dict[str, Any]], status: str) -> Callable[..., Awaitable[dict[str, Any]]]:
+def declared_tool_name(name: Any, declared: Iterable[str]) -> Any:
+    """The key the config declares for a tool the CLI names by its MCP wire name (``mcp__<server>__<tool>``):
+    the one declared key that is ``<tool>`` or ``<server>__<tool>``. A name that is not a wire name (no server
+    part), is itself declared, or that matches no declared key or more than one, is kept as it is."""
+    if not isinstance(name, str) or not name.startswith(_MCP_PREFIX) or name in declared:
+        return name
+    rest = name[len(_MCP_PREFIX) :]
+    server, sep, tool = rest.partition('__')
+    if not (server and sep and tool):
+        return name
+    matches = [k for k in declared if rest == k or rest.endswith(f'__{k}')]
+    return matches[0] if len(matches) == 1 else name
+
+
+def _config_documents(workdir: str | Path) -> Iterator[dict[str, Any]]:
+    """Every config document beside the harness in ``workdir``, at both rungs in order. A config that exists and
+    cannot be read raises its ``WorkspaceConfigError``."""
+    from plurai.ingest.workspace_config import bench_config_roots, discover_config_documents  # noqa: PLC0415
+
+    for root in bench_config_roots(Path(workdir) / 'simulate.py'):
+        for _path, document in discover_config_documents(root):
+            yield document
+
+
+@contextlib.contextmanager
+def _config_readable(unknown: str) -> Iterator[None]:
+    """A config beside the harness that exists and cannot be read is a :class:`HarnessFault`: ``unknown`` is unknown."""
+    from plurai.ingest.workspace_config import WorkspaceConfigError  # noqa: PLC0415
+
+    try:
+        yield
+    except WorkspaceConfigError as error:
+        raise HarnessFault(f'the config beside the harness cannot be read, so {unknown} is unknown: {error}') from error
+
+
+def read_tool_keys(workdir: str | Path) -> frozenset[str]:
+    """The ``tools:`` keys of the config beside the harness in ``workdir``. A config that exists and
+    cannot be read raises its ``WorkspaceConfigError``: a reader that is not :func:`confine` decides
+    what that means, and no harness fault is recorded on its behalf."""
+    keys: set[str] = set()
+    for document in _config_documents(workdir):
+        tools = document.get('tools')
+        keys |= {str(k) for k in tools if k} if isinstance(tools, dict) else set()
+    return frozenset(keys)
+
+
+def declared_tool_keys(workdir: str | Path) -> frozenset[str]:
+    """:func:`read_tool_keys`; a config that exists and cannot be read is a :class:`HarnessFault`."""
+    with _config_readable('which tools the agent declares'):
+        return read_tool_keys(workdir)
+
+
+#: :func:`confine`'s record key for the tools the session does not have, ``{name: owner}``: ``harness`` when the
+#: harness's own options left it out (not in its ``tools`` list, or in its ``disallowed_tools``), ``confinement``
+#: when :func:`confine` switched it off. The CLI answers a call to one before any hook fires.
+SWITCHED_OFF_KEY = 'switched_off'
+_TOOL_USE_ERROR_TAG = re.compile(r'</?tool_use_error>')
+#: An errored tool result, as the CLI writes it (compact) or as any JSON writer does.
+_IS_ERROR_TRUE = re.compile(r'"is_error"\s*:\s*true')
+
+
+def switched_off_tools(known: Iterable[str], *, offered: Sequence[str] | None, harness_off: Iterable[str], confine_off: Iterable[str]) -> dict[str, str]:
+    """``{name: owner}`` for each tool the session does not have (:data:`SWITCHED_OFF_KEY`). ``offered`` is the
+    harness's own ``tools`` list (``None`` = every built-in is offered), read against the ``known`` built-in names;
+    the harness owns what it left out, :func:`confine` only what it switched off itself."""
+    out: dict[str, str] = {}
+    if offered is not None:
+        offered_names = {str(t) for t in offered}
+        out.update({name: 'harness' for name in known if name not in offered_names})
+    out.update({str(name): 'harness' for name in harness_off if name})
+    for name in confine_off:
+        if name:
+            out.setdefault(str(name), 'confinement')
+    return dict(sorted(out.items()))
+
+
+def _jsonl_dicts(lines: Iterable[str]) -> Iterator[dict[str, Any]]:
+    """Each line that is a JSON object; any other line (a partial or still-written row) is skipped."""
+    for line in lines:
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(row, dict):
+            yield row
+
+
+def cli_transcript_rows(path: str | Path, prompt_ids: Iterable[str] = (), *, offsets: dict[str, int] | None = None) -> list[dict[str, Any]]:
+    """The rows of the CLI's session transcript (one JSON object per line) that :func:`reconcile_trail` reads:
+    none when the part read holds no errored tool result, else every row from the first one of the queries
+    ``prompt_ids`` (every row when none is named). Unparseable lines are skipped, an unreadable file read as empty.
+
+    With ``offsets`` (``{path: byte offset}``, one per session), only what was appended since the last read of
+    ``path`` is read, and its offset moves past the last complete line read. The file is append-only and each
+    turn's queries are new, so no row before them is needed again; a file shorter than its offset is read whole."""
+    key = str(path)
+    start = offsets.get(key, 0) if offsets is not None else 0
+    try:
+        with open(path, 'rb') as fh:
+            if fh.seek(0, os.SEEK_END) < start:
+                start = 0
+            fh.seek(start)
+            data = fh.read()
+    except OSError:
+        return []
+    if offsets is not None:
+        offsets[key] = start + data.rfind(b'\n') + 1
+    text = data.decode('utf-8', errors='replace')
+    if not _IS_ERROR_TRUE.search(text):
+        return []
+    wanted = [p for p in prompt_ids if p]
+    started = not wanted
+    rows: list[dict[str, Any]] = []
+    # lazy: once the query's first row is found, every later line is parsed
+    for row in _jsonl_dicts(line for line in text.splitlines() if started or any(p in line for p in wanted)):
+        if not started:
+            if row.get('promptId') not in wanted:
+                continue
+            started = True
+        rows.append(row)
+    return rows
+
+
+def _tool_result_text(block: Mapping[str, Any]) -> str:
+    content = block.get('content')
+    if isinstance(content, list):
+        content = '\n'.join(str(b.get('text') or '') for b in content if isinstance(b, dict) and b.get('type') == 'text')
+    return _TOOL_USE_ERROR_TAG.sub('', str(content or '')).strip()
+
+
+def reconcile_trail(trail: list[Any], rows: Sequence[Mapping[str, Any]], prompt_ids: Iterable[str], *, record: Any, declared: Iterable[str] = ()) -> list[Any]:
+    """``trail`` with a row for each tool call the CLI answered with an error in the queries ``prompt_ids``
+    (rows of its session transcript) whose id the trail lacks, each placed where the transcript ran it.
+
+    The CLI answers a call to a tool the session does not have, and a call whose input it rejects,
+    before any hook fires, so the recorders never see it. A call to a tool ``record`` (:func:`confine`'s
+    host-effects record) names switched off (:data:`SWITCHED_OFF_KEY`) is a ``denied`` row, refused ``by``
+    the owner it names, whatever the CLI's wording; any other errored call is an ``error`` row, a tool the
+    model made up included. MCP wire names are recorded by their ``declared`` key (:func:`declared_tool_name`).
+    A call is placed by the first row that ran it: the CLI's later request blobs repeat earlier calls."""
+    wanted = {p for p in prompt_ids if p}
+    uses: dict[str, tuple[int, str, Any]] = {}
+    errored: dict[str, str] = {}
+    for i, row in enumerate(rows):
+        message = row.get('message')
+        content = message.get('content') if isinstance(message, Mapping) else None
+        for block in content if isinstance(content, list) else ():
+            if not isinstance(block, Mapping):
+                continue
+            if block.get('type') == 'tool_use' and isinstance(block.get('id'), str):
+                uses.setdefault(block['id'], (i, str(block.get('name') or ''), block.get('input')))
+            elif block.get('type') == 'tool_result' and block.get('is_error') is True and isinstance(block.get('tool_use_id'), str):
+                if row.get('promptId') in wanted:
+                    errored.setdefault(block['tool_use_id'], _tool_result_text(block))
+    known = {entry.get('call_id') for entry in trail if isinstance(entry, Mapping)}
+    off = record.get(SWITCHED_OFF_KEY) if isinstance(record, Mapping) else None
+    switched_off: Mapping[str, Any] = off if isinstance(off, Mapping) else {}
+    missing: list[tuple[int, dict[str, Any]]] = []
+    for call_id, text in errored.items():
+        if call_id in known or call_id not in uses:
+            continue
+        at, name, args = uses[call_id]
+        entry: dict[str, Any] = {'tool': declared_tool_name(name, declared), 'args': args if isinstance(args, dict) else {}, 'call_id': call_id, 'result': text}
+        if (by := switched_off.get(name)) in ('confinement', 'harness'):
+            entry.update({'status': TRAIL_STATUS_DENIED, TRAIL_REFUSAL_KEY: {'by': by, 'reason': text}})
+        else:
+            entry['status'] = 'error'
+        missing.append((at, entry))
+    if not missing:
+        return trail
+    pending = sorted(missing, key=lambda item: item[0])
+    out: list[Any] = []
+    for entry in trail:
+        ran = uses.get(entry.get('call_id')) if isinstance(entry, Mapping) else None
+        ran_at = ran[0] if ran is not None else None
+        while pending and ran_at is not None and pending[0][0] < ran_at:
+            out.append(pending.pop(0)[1])
+        out.append(entry)
+    return [*out, *(entry for _at, entry in pending)]
+
+
+def _trail_recorder(trail: list[dict[str, Any]], status: str, declared: frozenset[str] = frozenset()) -> Callable[..., Awaitable[dict[str, Any]]]:
     """A ``PostToolUse`` (``status`` ``ok``) or ``PostToolUseFailure`` (``error``) hook that appends
-    each call to ``trail``. A failure carries ``error``, not ``tool_response``."""
+    each call to ``trail``, an MCP tool by its ``declared`` key (:func:`declared_tool_name`). A
+    failure carries ``error``, not ``tool_response``."""
 
     async def hook(input_data: dict[str, Any], tool_use_id: str | None, context: Any) -> dict[str, Any]:  # noqa: ARG001
         trail.append(
             {
-                'tool': input_data.get('tool_name'),
+                'tool': declared_tool_name(input_data.get('tool_name'), declared),
                 'args': input_data.get('tool_input'),
                 'call_id': input_data.get('tool_use_id') or tool_use_id,
                 'result': input_data.get('tool_response', input_data.get('error')),
@@ -1797,6 +1979,7 @@ _TOOLCHAIN_HOME_READ = (
 #: services, fonts, notifications, disk arbitration, configd, ...).
 _OPEN_MACH_LOOKUP = ('com.apple.*',)
 
+
 def _toolchain_reads(home: Path, withheld: Sequence[Path]) -> list[Path]:
     """The :data:`_TOOLCHAIN_HOME_READ` folders that exist, but any that holds or lies under a ``withheld`` path."""
     held = _both_forms(list(withheld))
@@ -2113,17 +2296,12 @@ def _sandbox_findings(where: str, block: Any, grant: UnsandboxedGrant) -> list[s
 def _declared_native_tools(workdir: Path) -> tuple[str, ...]:
     """``agent.native_tools`` from the config beside the harness (the scan records the agent's live
     built-ins there). A config that exists and cannot be read is a :class:`HarnessFault`."""
-    from plurai.ingest.workspace_config import WorkspaceConfigError, bench_config_roots, discover_config_documents  # noqa: PLC0415
-
     names: list[str] = []
-    try:
-        for root in bench_config_roots(Path(workdir) / 'simulate.py'):
-            for _path, document in discover_config_documents(root):
-                agent = document.get('agent')
-                declared = agent.get('native_tools') if isinstance(agent, dict) else None
-                names += [str(n) for n in declared or () if n] if isinstance(declared, list) else []
-    except WorkspaceConfigError as error:
-        raise HarnessFault(f'the config beside the harness cannot be read, so which built-ins the agent has is unknown: {error}') from error
+    with _config_readable('which built-ins the agent has'):
+        for document in _config_documents(workdir):
+            agent = document.get('agent')
+            declared = agent.get('native_tools') if isinstance(agent, dict) else None
+            names += [str(n) for n in declared or () if n] if isinstance(declared, list) else []
     return tuple(dict.fromkeys(names))
 
 
@@ -2167,8 +2345,10 @@ def confine(options: Any, *, run_dir: Path, repo: Path, workdir: Path, trail: li
     every read was seen, since a path a command builds at run time is held by the sandbox alone.
 
     Every tool call the CLI runs or denies is appended to ``trail`` (the recipe's entry shape, status
-    ``ok``, ``error`` or ``denied``), and the record says so (``trail``: :data:`TRAIL_RECORDED`): the
-    harness returns the turn's slice as ``agent_state['tool_trail']`` and installs no hooks of its own.
+    ``ok``, ``error`` or ``denied``; an MCP tool by its declared key), and the record says so
+    (``trail``: :data:`TRAIL_RECORDED`): the harness returns the turn's slice as
+    ``agent_state['tool_trail']`` and installs no hooks of its own. A call the CLI answers before any
+    hook fires is added at turn end from the CLI's session transcript (:func:`reconcile_trail`).
 
     Deny-by-default: a built-in runs ungranted only when it is on :data:`READ_ONLY_BUILTINS`. The
     ungranted ones of :data:`HOST_EFFECT_TOOLS` are confined in place or switched off by name, so are
@@ -2179,6 +2359,9 @@ def confine(options: Any, *, run_dir: Path, repo: Path, workdir: Path, trail: li
     if not hasattr(options, 'strict_mcp_config'):
         raise HarnessFault("the agent's claude_agent_sdk has no strict_mcp_config — upgrade claude-agent-sdk")
     plugin_servers = _plugin_mcp_servers(options)
+    # what the harness's own options switch off, read before confine edits them
+    offered = getattr(options, 'tools', None)
+    harness_off = getattr(options, 'disallowed_tools', None) or []  # confine adds to a new list, never this one
     grant = unsandboxed_grant(workdir)  # a grant it refuses leaves the options untouched
     declared = declared_host_requirements(workdir) or ()
     # the CLI applies its user settings' env over the environment it starts with
@@ -2220,8 +2403,9 @@ def confine(options: Any, *, run_dir: Path, repo: Path, workdir: Path, trail: li
     hooks: dict[str, list[Any]] = dict(options.hooks or {})
     for event, matchers in cli_hooks(scope, trail=trail, on_read_denied=read_refused).items():
         hooks[event] = [*hooks.get(event, []), *matchers]  # the agent's own first
+    tool_keys = declared_tool_keys(workdir)
     for event, status in (('PostToolUse', 'ok'), ('PostToolUseFailure', 'error')):
-        recorder: Any = _trail_recorder(trail, status)  # claude_agent_sdk HookCallbacks
+        recorder: Any = _trail_recorder(trail, status, tool_keys)  # claude_agent_sdk HookCallbacks
         hooks[event] = [*hooks.get(event, []), HookMatcher(hooks=[observer, recorder])]
     options.hooks = hooks
     denied = {}
@@ -2323,6 +2507,13 @@ def confine(options: Any, *, run_dir: Path, repo: Path, workdir: Path, trail: li
     return {
         'granted': sorted(granted),
         'denied': denied,
+        # the tools this session does not have, by who switched each off: a call to one is a refusal, not an error
+        SWITCHED_OFF_KEY: switched_off_tools(
+            [*read_only, *candidates],
+            offered=offered if isinstance(offered, list | tuple) else None,
+            harness_off=harness_off,
+            confine_off=options.disallowed_tools or (),  # the harness's own first: switched_off_tools keeps their owner
+        ),
         'cwd': str(run_dir),
         'shell_home': str(shell_home),
         'auth': route,

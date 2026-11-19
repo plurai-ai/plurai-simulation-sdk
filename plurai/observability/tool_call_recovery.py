@@ -41,9 +41,10 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 from collections import Counter
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, Final, Literal, NotRequired, Protocol, TypedDict, runtime_checkable
 
 if TYPE_CHECKING:
@@ -1799,39 +1800,66 @@ def merged_tool_calls(tool_events: dict | None, chatbot_messages: list | None, a
     return merged
 
 
-def _sequence_events(events: list[Any], added: list[dict[str, Any]]) -> list[Any]:
-    """Order the recovered lane INTO the mock lane by conversation turn.
+def _in_call_order(recovered: list[dict[str, Any]], events: list[Any], added: list[dict[str, Any]]) -> list[Any]:
+    """``events`` with the ``added`` rows placed where the calls happened: by turn, then by call order within it.
 
-    The two lanes reach this module already chronological within themselves — the mock
-    lane is append-ordered by the engine, the recovered lane is message-ordered — so the
-    merge is a two-lane interleave, not a global re-sort. The rules differ per lane, and
-    deliberately:
+    Neither lane carries a clock, so call order is read off each lane's own order and anchored to the mock log by
+    the rows the union DROPPED (:func:`union_by_call_identity`). ``recovered`` is every row offered to the union, in
+    lane order; ``added`` the ones it admitted (the very objects), plus any typed decision records.
 
-    * MOCK LANE: its own order is the authoritative chronology, so its sort key is the
-      RUNNING MAX of the turns seen so far. A stamp that is stale (a nested session that
-      outlived the turn it was spawned in) or absent (an ``observe`` / ``state_update``
-      event, an artifact whose events carry no stamps) therefore inherits its
-      predecessor's position and can never reorder this lane against itself.
-    * RECOVERED LANE: positioned by its OWN turn, which is the whole point — a real-tool
-      call from turn 1 must not be serialized after turn 2's mock calls. A record with no
-      turn (whole-transcript recovery) inherits the mock lane's last turn, keeping it at
-      the end where plain concatenation put it, rather than being re-bucketed onto turn 0
-      ahead of the real turn-0 events.
-
-    The index is part of the key, so equal turns keep insertion order (mock lane first).
+    * TURN FIRST. A mock event's turn is the RUNNING MAX of the stamps seen so far: the mock log is append-ordered
+      by the engine, so a stale stamp (a nested session that outlived its turn) or an absent one (``observe``,
+      ``state_update``, an artifact whose events carry no stamps) inherits its predecessor's place and the mock lane
+      is never reordered against itself. A recovered row takes its OWN turn — a real-tool call from turn 1 is not
+      serialized after turn 2's mock calls. A turnless row (whole-transcript recovery) takes the mock lane's last
+      turn and goes at the end.
+    * WITHIN A TURN, EACH LANE IN ITS OWN ORDER. A row the union dropped stands for a logged call of its turn — the
+      next unclaimed mock ``tool_call`` of its tool there, and a lane's anchor only moves forward. An admitted row
+      goes right after the logged call its lane's nearest earlier dropped row stands for; admitted rows before the
+      lane's first dropped row go right before the logged call that row stands for. The trail and message lanes are
+      already settled to disjoint tool names (:func:`_settle_out_of_band_lanes`), so they never claim one call.
+    * NO EVIDENCE, AFTER THE TURN'S MOCK ROWS. A lane with no dropped row in a turn, and anything admitted that is not an offered
+      row (an interrupt decision), goes after the turn's mock rows, in admission order.
     """
-    keyed: list[tuple[int, int, Any]] = []
-    carried = 0
-    for idx, event in enumerate(events):
+    # Admission rank of each admitted record not yet placed; placing a record pops it.
+    unplaced = {id(record): rank for rank, record in enumerate(added)}
+    keyed: list[tuple[tuple[int, float, int, int], Any]] = []
+
+    def place(record: dict[str, Any], turn: int, anchor: float, slot: int) -> None:
+        keyed.append(((turn, anchor, slot, unplaced.pop(id(record))), record))
+
+    unclaimed: dict[tuple[int, Any], list[int]] = {}
+    mock_turn = 0
+    for index, event in enumerate(events):
         raw = event.get('turn') if isinstance(event, dict) else None
         if raw is not None:
-            carried = max(carried, _coerce_turn(raw))
-        keyed.append((carried, idx, event))
-    for idx, record in enumerate(added, start=len(events)):
-        raw = record.get('turn')
-        keyed.append((_coerce_turn(raw) if raw is not None else carried, idx, record))
-    keyed.sort(key=lambda item: (item[0], item[1]))
-    return [item[2] for item in keyed]
+            mock_turn = max(mock_turn, _coerce_turn(raw))
+        keyed.append(((mock_turn, index, 0, 0), event))
+        if isinstance(event, dict) and event.get('type') == 'tool_call':
+            unclaimed.setdefault((mock_turn, event.get('tool')), []).append(index)
+    anchors: dict[tuple[int, Any], int] = {}
+    pending: dict[tuple[int, Any], list[dict[str, Any]]] = {}
+    for record in recovered:
+        if (raw := record.get('turn')) is None:
+            continue
+        turn = _coerce_turn(raw)
+        lane = (turn, record.get('_lane'))
+        if id(record) in unplaced:
+            if lane in anchors:
+                place(record, turn, anchors[lane], 1)
+            else:
+                pending.setdefault(lane, []).append(record)
+        elif claim := unclaimed.get((turn, record.get('tool'))):
+            anchor = claim.pop(0)
+            for early in pending.pop(lane, []):
+                place(early, turn, anchor, -1)
+            anchors[lane] = max(anchors.get(lane, anchor), anchor)
+    for record in added:
+        if id(record) in unplaced:
+            raw = record.get('turn')
+            place(record, _coerce_turn(raw) if raw is not None else mock_turn, math.inf, 2)
+    keyed.sort(key=lambda item: item[0])
+    return [item[1] for item in keyed]
 
 
 #: Marker a mock handler stamps into its response envelope when the handler itself raised.
@@ -1957,12 +1985,13 @@ def merge_recovered_tool_calls(
     counts are then a floor, and this is a library, so it says so in the payload rather than on
     a stream nobody is reading.
 
-    The union is ORDERED, not concatenated: ``events`` comes back as the turn-ordered
-    interleave of the two lanes (see :func:`_sequence_events`), so a reader of
-    ``tool_events.json`` — human or judge — can take the event order as the order the
-    calls happened in. Pass ``recovered_calls`` (per-turn recovery, hence turn-stamped)
-    to get that ordering; the ``messages`` fallback recovers over the whole transcript,
-    which yields turn-less records that can only go at the end.
+    The union is ORDERED, not concatenated: ``events`` comes back in call order — by turn,
+    and within a turn each recovered lane in its own order, anchored to the mock log by the
+    rows the union deduped (see :func:`_in_call_order`) — so a reader of ``tool_events.json``
+    — human or judge — can take the event order as the order the calls happened in. Pass
+    ``recovered_calls`` (per-turn recovery, hence turn-stamped) to get that ordering; the
+    ``messages`` fallback recovers over the whole transcript, which yields turn-less records
+    that can only go at the end.
 
     ``agent_states`` adds the THIRD lane — the harness's self-reported trail, the only
     channel a self-looping agent has (:func:`trail_tool_calls`). Its records are always
@@ -1975,7 +2004,7 @@ def merge_recovered_tool_calls(
     # The user's answers to interrupts ride beside the calls, one typed record per decided call: a
     # consumer that re-derives the calls from the chain drops the cached rows, and the decision —
     # which no message spells — would otherwise go with them.
-    return _union_into_payload(tool_events, [dict(record) for record in recovered], decisions=tool_decision_events(message_calls), sequence=_sequence_events)
+    return _union_into_payload(tool_events, recovered, decisions=tool_decision_events(message_calls))
 
 
 def merge_pipeline_trail(tool_events: dict[str, Any] | None, trail: Any) -> dict[str, Any] | None:
@@ -1986,41 +2015,11 @@ def merge_pipeline_trail(tool_events: dict[str, Any] | None, trail: Any) -> dict
     tool around a mocked one. Its rows become the SAME ``tool_call`` records the dialog's trail lane
     makes (:func:`trail_tool_calls`), all on turn 0 because the whole hop is one logical turn, and
     are deduped against the mock's log by the same rule (:func:`union_by_call_identity`), so a call
-    both lanes recorded counts once. Placed in CALL order (:func:`_in_trail_order`), not turn order.
+    both lanes recorded counts once. Placed in CALL order (:func:`_in_call_order`): every row and every logged call of a
+    hop is turn 0, so it is the trail's own order that places them.
     """
-    records = [dict(record) for record in _one_row_per_turn_call(trail_tool_calls([{AGENT_STATE_TOOL_TRAIL_KEY: trail}]))]
-    return _union_into_payload(tool_events, records, decisions=[], sequence=lambda events, added: _in_trail_order(records, events, added))
-
-
-def _in_trail_order(trail: list[dict[str, Any]], events: list[Any], added: list[dict[str, Any]]) -> list[Any]:
-    """``events`` with the ``added`` trail rows placed where the trail says they ran.
-
-    Turn order cannot place them: every row and every logged call of a hop is turn 0, so
-    :func:`_sequence_events` would put each admitted row after every logged call, and a
-    ``called_before`` over a wrapper and the mocked call it made would read backwards. The trail
-    IS the call order: a row the union dropped stands for a logged call (the next unclaimed one of
-    its tool), and each admitted row goes right after the logged call its nearest earlier dropped
-    row stands for — before the first logged call when no row precedes it.
-    """
-    admitted = {id(record) for record in added}
-    unclaimed: dict[Any, list[int]] = {}
-    for index, event in enumerate(events):
-        if isinstance(event, dict) and event.get('type') == 'tool_call':
-            unclaimed.setdefault(event.get('tool'), []).append(index)
-    anchor = min((indices[0] for indices in unclaimed.values()), default=len(events)) - 1
-    placed: dict[int, list[Any]] = {}
-    for record in trail:
-        if id(record) in admitted:
-            placed.setdefault(anchor, []).append(record)
-            admitted.discard(id(record))
-        elif unclaimed.get(record.get('tool')):
-            anchor = max(anchor, unclaimed[record.get('tool')].pop(0))
-    out: list[Any] = list(placed.get(-1, []))
-    for index, event in enumerate(events):
-        out.append(event)
-        out.extend(placed.get(index, []))
-    # Anything admitted that is not a trail row keeps the turn-order rule's place: the end.
-    return out + [record for record in added if id(record) in admitted]
+    trail_rows = _one_row_per_turn_call(trail_tool_calls([{AGENT_STATE_TOOL_TRAIL_KEY: trail}]))
+    return _union_into_payload(tool_events, trail_rows, decisions=[])
 
 
 def _union_into_payload(
@@ -2028,14 +2027,13 @@ def _union_into_payload(
     recovered: list[dict[str, Any]],
     *,
     decisions: list[dict[str, Any]],
-    sequence: Callable[[list[Any], list[dict[str, Any]]], list[Any]],
 ) -> dict[str, Any] | None:
-    """The finalize ``tool_events`` payload: ``recovered`` unioned into the mock log by call identity,
-    ``sequence`` placing the admitted rows among the logged events, and the receipts stamped.
+    """The finalize ``tool_events`` payload: copies of ``recovered`` unioned into the mock log by call identity,
+    :func:`_in_call_order` placing the admitted rows among the logged events, and the receipts stamped.
 
-    The one body behind :func:`merge_recovered_tool_calls` (dialog: turn order) and
-    :func:`merge_pipeline_trail` (one-shot hop: the trail's call order).
+    The one body behind :func:`merge_recovered_tool_calls` (dialog) and :func:`merge_pipeline_trail` (one-shot hop).
     """
+    recovered = [dict(record) for record in recovered]
     absent = not isinstance(tool_events, dict)
     base = dict(tool_events) if isinstance(tool_events, dict) else {}
     events = normalize_tool_event_status(base.get('events'))
@@ -2057,9 +2055,9 @@ def _union_into_payload(
     # record answering with an error envelope would ship ``status: 'ok'`` while a byte-identical
     # mocked record shipped ``status: 'error'`` — the split-brain normalize_tool_event_status
     # exists to end, re-entering through this lane. Normalized AFTER sequencing (the normalizer
-    # maps one-to-one and leaves a normalized event as it is), so ``sequence`` sees the very
+    # maps one-to-one and leaves a normalized event as it is), so :func:`_in_call_order` sees the very
     # records the union admitted.
-    base['events'] = normalize_tool_event_status(sequence(events, added + decisions)) if added or decisions else events
+    base['events'] = normalize_tool_event_status(_in_call_order(recovered, events, added + decisions)) if added or decisions else events
     if floored:
         base[TOOL_CALL_COUNT_FLOOR_KEY] = {'suppressed': sum(floored.values()), 'by_tool': {str(name): n for name, n in floored.items()}}
     # Computed over the rows the union ADMITTED, not over everything recovered. A recovered row

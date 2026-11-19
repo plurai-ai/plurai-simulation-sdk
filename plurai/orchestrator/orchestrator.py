@@ -86,11 +86,16 @@ from plurai._protocol import (
     observed_actions_or_none,
 )
 from plurai._subprocess import ChildProcess
-from plurai.child_env import launch_environment
+from plurai.child_env import AGENT_ENV_KEY, launch_environment, misplaced_agent_keys
 from plurai.agent_io import AGENT_IO_KEY, DEFAULT_AGENT_IO, INPUT_FIELD, INPUT_PART_KINDS, OPENS_ALWAYS, OPENS_FIELD, AgentIO, declared_agent_io
 from plurai.channels import CHANNEL_INPUTS_KEY, parse_channel_plan
 from plurai.gates.apply import make_finding
-from plurai.gates.catalogue import HARNESS_AGENT_IO_UNKNOWN_FIELD, HARNESS_AGENT_IO_UNKNOWN_PART_KIND, WORLD_UNRESET_EXTERNAL
+from plurai.gates.catalogue import (
+    HARNESS_AGENT_IO_UNKNOWN_FIELD,
+    HARNESS_AGENT_IO_UNKNOWN_PART_KIND,
+    HARNESS_AGENT_KEY_MISPLACED,
+    WORLD_UNRESET_EXTERNAL,
+)
 from plurai.gates.contract import GateFinding
 from plurai.ingest.workspace_config import CONFIG_FILENAME, WorkspaceConfigError, bench_config_roots, discover_config_documents
 from plurai.orchestrator._retry import CreditRefused, is_transient_for_idempotent, job_refused_for_credit
@@ -1274,7 +1279,12 @@ def _seed_only(msg: _MessageIdentity, *, sent_user_messages: frozenset[str]) -> 
     """
     if msg.type == 'tool' or msg.tool_calls:
         return True
-    return msg.type == 'human' and msg.content not in sent_user_messages
+    if msg.type != 'human':
+        return False
+    # A seeded human turn that handed over a document carries a parts LIST, which is unhashable;
+    # ``sent_user_messages`` holds the same ``content_text`` projection of what was sent.
+    said = msg.content if isinstance(msg.content, str) else content_text(msg.content)
+    return said not in sent_user_messages
 
 
 def _undetermined(seeded_messages: int, relisted: int, why: str) -> dict[str, Any]:
@@ -2781,6 +2791,37 @@ def turn_input_findings(simulate_path: Path | str) -> tuple[GateFinding, ...]:
     return tuple(out)
 
 
+def agent_key_findings(simulate_path: Path | str) -> tuple[GateFinding, ...]:
+    """Each nested ``agent: {env: …}`` beside ``simulate_path``, as an advisory finding that holds nothing.
+
+    Read through :func:`plurai.child_env.misplaced_agent_keys`, the same reader the child's environment is built
+    from, so a list reported as read is the list the agent got. Raises what that reader raises on a config
+    that cannot be read at all.
+    """
+    path = Path(simulate_path)
+    out: list[GateFinding] = []
+    for item in misplaced_agent_keys(path):
+        source = _bench_relative(item.source, path)
+        if item.defect is None:
+            remedy = (
+                f'`{item.key}` in {source} is read as the root key `{AGENT_ENV_KEY}`. Move the list to the root of {CONFIG_FILENAME} '
+                f'(`{AGENT_ENV_KEY}:` beside `agent.io:`) so every reader sees the same declaration.'
+            )
+        else:
+            remedy = f'`{item.key}` in {source} {item.defect} None of its names reaches the agent. Write it as the root key `{AGENT_ENV_KEY}: [NAME, …]`.'
+        out.append(
+            make_finding(
+                HARNESS_AGENT_KEY_MISPLACED,
+                subject=item.key,
+                evidence={'key': item.key, 'read_as': item.read_as, 'defect': item.defect, 'source': source},
+                observed={},
+                remedy=remedy,
+                draft_ref=None,
+            )
+        )
+    return tuple(out)
+
+
 #: The typed failure kind of a scenario that has no opening user message on a harness that never declared
 #: it can open. ``harness_`` makes it harness-owned (``_protocol.is_harness_owned``): the row is not
 #: valid, never a failed agent trial.
@@ -2989,6 +3030,8 @@ class ThreadResult:
     # The keys of ``initial_agent_context`` the harness never read (``ChildProcess.unread_inputs``);
     # ``None`` = not recorded. Carried beside them so the transcript records what the agent did NOT get.
     unread_inputs: list[str] | None = None
+    # ``ChildProcess.clock_delivery`` (see plurai.clock), carried to the transcript so a re-score reads the same fact.
+    clock_delivery: str | None = None
     # The world right after ``seed_state`` (``ChildProcess.post_seed_world_state``); ``None`` = not read.
     # The world the run started from: the backend decides origins against it, live and on a re-score.
     post_seed_world_state: dict[str, Any] | None = None
@@ -4334,6 +4377,7 @@ class Orchestrator:
                 # ``getattr``: a ``child_factory`` child need not record reads, and then claims nothing.
                 unread_inputs: list[str] | None = with_unread_parts(getattr(child, 'unread_inputs', None), getattr(child, 'unread_parts', None))
                 post_seed_world_state: dict[str, Any] | None = getattr(child, 'post_seed_world_state', None)
+                clock_delivery: str | None = getattr(child, 'clock_delivery', None)
 
                 # The turns the PARENT emptied on the agent's behalf, read INSIDE the child
                 # scope (the closing turn can degrade too, so this is the last honest moment).
@@ -4511,6 +4555,7 @@ class Orchestrator:
                 user_action_result=closing_user_action_result,
                 unread_inputs=unread_inputs,
                 post_seed_world_state=post_seed_world_state,
+                clock_delivery=clock_delivery,
             )
             await self._emit_observability(
                 thread,
@@ -4548,6 +4593,7 @@ class Orchestrator:
                 initial_agent_context=initial_agent_context,
                 unread_inputs=unread_inputs,
                 post_seed_world_state=post_seed_world_state,
+                clock_delivery=clock_delivery,
                 degraded_turns=degraded_turns,
                 ipc_trimmed_turns=ipc_trimmed_turns,
                 # Only the rules that FIRED. An empty dict is "the agent channel is exactly what
@@ -4629,7 +4675,11 @@ class Orchestrator:
         world, events, unanswered, retryable = await child.finalize()
         if _finalize_error_message(world, events) is not None and retryable:
             if await wait_until_ready(self.client, mock_service_url=mock_service_url, mock_mode=mock_mode):
+                # The route the first answer carried survives a re-ask that carries none, as ``unanswered`` merges below.
+                first_clock_delivery = getattr(child, 'clock_delivery', None)
                 again_world, again_events, more, _ = await child.finalize()
+                if first_clock_delivery is not None and getattr(child, 'clock_delivery', None) is None:
+                    child.clock_delivery = first_clock_delivery
                 if isinstance(world, dict) and _FINALIZE_ERROR_MARKER in world:
                     world = again_world
                 if isinstance(events, dict) and _FINALIZE_ERROR_MARKER in events:
@@ -4800,6 +4850,7 @@ class Orchestrator:
             # A reaped child recorded nothing, so it claims nothing.
             unread_inputs: list[str] | None = getattr(child, 'unread_inputs', None)
             post_seed_world_state: dict[str, Any] | None = getattr(child, 'post_seed_world_state', None)
+            clock_delivery: str | None = getattr(child, 'clock_delivery', None)
         self._child_closed()
 
         # The hop's recorded trail, returned beside its outputs: the only record of a call that never
@@ -4848,6 +4899,7 @@ class Orchestrator:
             pipeline_error=pipeline_error,
             unread_inputs=unread_inputs,
             post_seed_world_state=post_seed_world_state,
+            clock_delivery=clock_delivery,
             # Only the client-measured reasons cross the wire (``RELAYED_REASONS``); ``seed_not_landed`` is local.
             ended_early=ended_early if ended_early in RELAYED_REASONS else None,
         )
@@ -4886,6 +4938,7 @@ class Orchestrator:
             initial_agent_context=initial_agent_context,
             unread_inputs=unread_inputs,
             post_seed_world_state=post_seed_world_state,
+            clock_delivery=clock_delivery,
             scenario_shape=PIPELINE_SHAPE,
             # ``timed_out`` is lifted OUT of the error dict as well as left in it: "did this hop
             # hang?" is the first question asked of a slow suite, and a reader should not have to
@@ -4973,6 +5026,7 @@ class Orchestrator:
         user_action_result: dict[str, Any] | None = None,
         unread_inputs: list[str] | None,
         post_seed_world_state: dict[str, Any] | None,
+        clock_delivery: str | None,
     ) -> FinalizeResponse:
         """Async finalize: POST mode:async → poll → return result.
 
@@ -5042,6 +5096,7 @@ class Orchestrator:
                     user_action_result=user_action_result,
                     unread_inputs=unread_inputs,
                     post_seed_world_state=post_seed_world_state,
+                    clock_delivery=clock_delivery,
                     overrules=overrules,
                 ),
                 endpoint='/threads/{id}/finalize',

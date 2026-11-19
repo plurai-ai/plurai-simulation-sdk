@@ -647,6 +647,7 @@ class OrchestratorClient:
         user_action_result: dict[str, Any] | None = None,
         unread_inputs: list[str] | None = None,
         post_seed_world_state: dict[str, Any] | None = None,
+        clock_delivery: str | None = None,
         overrules: Sequence[Overrule],
     ) -> FinalizeJobSubmitResponse:
         """POST /threads/{id}/finalize (async submit) → typed ``FinalizeJobSubmitResponse``.
@@ -723,6 +724,8 @@ class OrchestratorClient:
             unread_inputs=unread_inputs,
             # The world right after ``seed_state`` (``None`` = not read); the backend takes origins against it.
             post_seed_world_state=post_seed_world_state,
+            # see plurai.clock
+            clock_delivery=clock_delivery,
             overrules=_wire_overrules(overrules),
         ).model_dump(exclude_none=False)
         payload = _json_body('/threads/{id}/finalize', body)

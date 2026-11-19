@@ -451,7 +451,8 @@ class AgentFault(Exception):  # noqa: N818  # public name, raised by a harness o
 
     ``invoke_agent`` raising it is read as ``agent_raised`` (a failed trial the agent owns) — on the raised
     exception itself, never its chain, and only after the provider check and any harness fault recorded in the
-    turn. It records nothing, so it never hides a ``HarnessFault``.
+    turn. It records nothing, so it never hides a ``HarnessFault``. A message that embeds the provider's own
+    spend-cap error envelope verbatim is read as ``provider_infra`` instead: the agent's provider refused the call.
     """
 
     def __init__(self, *args: object) -> None:
@@ -1386,6 +1387,8 @@ class FinalizeResponse:
     during the session (:mod:`plurai._mocking.interception_watch`): calls made after the change may have
     reached the real service, and the world does not hold their effects. ``None`` when none changed, or
     when the harness recorded none.
+
+    ``clock_delivery`` is how the scenario's date reached the agent (see :mod:`plurai.clock`).
     """
 
     final_world_state: dict[str, Any] | None = None
@@ -1396,6 +1399,7 @@ class FinalizeResponse:
     unread_inputs: list[str] | None = None
     unread_parts: list[str] | None = None
     interception_changed: list[str] | None = None
+    clock_delivery: str | None = None
     type: Literal['finalize_response'] = 'finalize_response'
 
 
@@ -1445,6 +1449,7 @@ _OMITTED_WHEN_UNSET: frozenset[str] = frozenset(
         'capture_retryable',
         'channel_inputs',
         'channel_results',
+        'clock_delivery',
         'egress_guard_armed',
         'entry_witness',
         'interception_changed',

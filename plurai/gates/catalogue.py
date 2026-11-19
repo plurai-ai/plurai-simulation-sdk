@@ -187,6 +187,7 @@ HARNESS_SHAPE_OVERRIDE_CONTRADICTS_DECLARATION: Final[str] = 'harness.shape_over
 HARNESS_AGENT_IO_MALFORMED: Final[str] = 'harness.agent_io_malformed'
 HARNESS_AGENT_IO_UNKNOWN_FIELD: Final[str] = 'harness.agent_io_unknown_field'
 HARNESS_AGENT_IO_UNKNOWN_PART_KIND: Final[str] = 'harness.agent_io_unknown_part_kind'
+HARNESS_AGENT_KEY_MISPLACED: Final[str] = 'harness.agent_key_misplaced'
 WORLD_UNRESET_EXTERNAL: Final[str] = 'world.unreset_external'
 WORLD_USER_SURFACES_MALFORMED: Final[str] = 'world.user_surfaces_malformed'
 WORLD_USER_SURFACE_ENTRY_UNREADABLE: Final[str] = 'world.user_surface_entry_unreadable'
@@ -451,6 +452,7 @@ GATES: Final[Mapping[str, GateSpec]] = MappingProxyType(
             'source',
         ),
         HARNESS_AGENT_IO_UNKNOWN_PART_KIND: _advisory('key', 'value', 'source'),
+        HARNESS_AGENT_KEY_MISPLACED: _advisory('key', 'read_as', 'defect', 'source'),
         WORLD_UNRESET_EXTERNAL: _holding(
             'the declared world is not the mock and no module-scope reset is bound, so each scenario may open on its '
             "predecessor's writes; only a reader of the agent's tools can say whether it writes",

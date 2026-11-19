@@ -48,6 +48,7 @@ from plurai.world.seed_landing import BACKEND_TRANSPORT_FAILURE_KEY
 from plurai._entry_witness import EntryWitness
 from plurai._platform import is_windows, utf8_stdio
 from plurai._input_reads import InputReads, is_bound_document, unread_inputs
+from plurai.clock import recorded_clock_delivery, take_clock_delivery
 from plurai._mocking import session as mock_session
 from plurai._mocking.client import MockServiceError
 from plurai._mocking.interception_watch import interception_changed
@@ -61,6 +62,7 @@ from plurai._mocking.turn_context import (
     harness_setup,
     last_cli_query,
     note_harness_fault,
+    peek_cli_queries,
     peek_cli_stops,
     refusal_cause,
     set_current_turn,
@@ -126,7 +128,19 @@ from plurai.channels import (
     parse_channel_plan,
     scenario_plants_channels,
 )
-from plurai.host_effects import INFRA_STOP_CLASSES, STOP_FAILURE_SOURCE, RedactingStream, end_cli_processes_in_loop, redact_cli_credentials
+from plurai.host_effects import (
+    HOST_EFFECTS_KEY,
+    INFRA_STOP_CLASSES,
+    STOP_FAILURE_SOURCE,
+    RedactingStream,
+    _config_documents,
+    _jsonl_dicts,
+    cli_transcript_rows,
+    end_cli_processes_in_loop,
+    reconcile_trail,
+    redact_cli_credentials,
+    trail_recorded,
+)
 from plurai.ingest.workspace_config import CONFIG_FILENAME, WorkspaceConfigError, bench_config_roots, discover_config_documents
 from plurai.observability.tool_call_recovery import (
     AGENT_STATE_TOOL_TRAIL_KEY,
@@ -146,7 +160,7 @@ from plurai.scan_contract.input_channels import ChannelKind
 # the parent's run-start gates and this child answer the same two questions off the same two local
 # files, and a second copy of either name is how one of them comes to act on a word the other no
 # longer uses. Free at import time — ``import plurai`` above already loads this module.
-from plurai.orchestrator.orchestrator import WORLD_OWNER_MOCK, WORLD_SNAPSHOT_HOOK, _declared_native_tools, _declared_world_owner
+from plurai.orchestrator.orchestrator import WORLD_OWNER_MOCK, WORLD_SNAPSHOT_HOOK, _declared_world_owner
 from plurai.run_artifacts import _NON_AGENT_TYPES, LC_MESSAGE_TYPES, SEED_REPORT_UNREADABLE_KEY, _text_of, declared_message_type
 from plurai.sdk_turn_faults import PROVIDER_TURN_FAULT_KEY, TURN_END_UNOBSERVED_KEY, provider_turn_fault_marker
 from plurai.user_surfaces import UserSurfacesConfigError, discover_surface_types
@@ -1652,6 +1666,11 @@ class _ChildSession:
         self._dialog: list[dict[str, Any]] = []
         self._live_tool_calls: list[dict[str, Any]] = []
         self._live_tools: frozenset[str] | None = None
+        self._tool_keys: frozenset[str] | None = None
+        # ``(live, keys)`` read once from the config beside the harness, or why it could not be (see :meth:`_tools_declared`).
+        self._tools_read: tuple[frozenset[str], frozenset[str]] | WorkspaceConfigError | None = None
+        # How far each CLI session transcript was read, ``{path: byte offset}`` (:func:`plurai.host_effects.cli_transcript_rows`).
+        self._transcript_offsets: dict[str, int] = {}
         self._owned_types: frozenset[str] | None = None
         self._owned_types_read = False
         self._undeclared_hook_types_named = False
@@ -1712,6 +1731,19 @@ class _ChildSession:
             self._agent_io = (declared_agent_io(source) or DEFAULT_AGENT_IO) if source else DEFAULT_AGENT_IO
         return self._agent_io
 
+    def _tools_declared(self) -> tuple[frozenset[str], frozenset[str]]:
+        """``(live, keys)`` (:func:`_declared_tools`) beside this harness, read once; a config that cannot be read
+        raises its ``WorkspaceConfigError`` on every ask. A module with no ``__file__`` declares none."""
+        if self._tools_read is None:
+            source = getattr(self.module, '__file__', None)
+            try:
+                self._tools_read = _declared_tools(Path(source)) if source else (frozenset(), frozenset())
+            except WorkspaceConfigError as exc:
+                self._tools_read = exc
+        if isinstance(self._tools_read, WorkspaceConfigError):
+            raise self._tools_read
+        return self._tools_read
+
     @property
     def live_tools(self) -> frozenset[str]:
         """The tools this harness runs for real, read once from the config beside it.
@@ -1722,13 +1754,49 @@ class _ChildSession:
         none, loudly.
         """
         if self._live_tools is None:
-            source = getattr(self.module, '__file__', None)
             try:
-                self._live_tools = _declared_live_tools(Path(source)) if source else frozenset()
+                self._live_tools = self._tools_declared()[0]
             except WorkspaceConfigError as exc:
                 print(f'[plurai.child] tool modes unreadable, so no live tool result is given to the mock: {exc}', file=sys.stderr, flush=True)
                 self._live_tools = frozenset()
         return self._live_tools
+
+    @property
+    def tool_keys(self) -> frozenset[str]:
+        """The ``tools:`` keys of the config beside this harness, read once. A module with no ``__file__``
+        declares none; a config that cannot be read declares none, loudly."""
+        if self._tool_keys is None:
+            # The raw reader: a config read here records no harness fault, so it can never type the turn.
+            try:
+                self._tool_keys = self._tools_declared()[1]
+            except WorkspaceConfigError as exc:
+                print(f'[plurai.child] declared tools unreadable, so MCP tools are recorded by their wire names: {exc}', file=sys.stderr, flush=True)
+                self._tool_keys = frozenset()
+        return self._tool_keys
+
+    def _with_unhooked_calls(self, state: Any, queries: Sequence[CliQueryStart]) -> Any:
+        """``state`` (a turn's ``agent_state``) with its recorded trail (:func:`plurai.host_effects.trail_recorded`)
+        reconciled against this turn's queries in the CLI's session transcript: an errored call the CLI answered
+        before any hook fired is added (:func:`plurai.host_effects.reconcile_trail`). Read on the turn that
+        returned and on the one that ended in an error envelope alike. Any other state is returned as it is; a
+        reconcile that fails leaves the trail as the harness returned it, loudly."""
+        if not queries or not trail_recorded(state):
+            return state
+        try:
+            trail = state[AGENT_STATE_TOOL_TRAIL_KEY]
+            if not isinstance(trail, list):
+                return state
+            prompt_ids = [q.prompt_id for q in queries]
+            reconciled = trail
+            for path in dict.fromkeys(q.transcript_path for q in queries if q.transcript_path):
+                rows = cli_transcript_rows(path, prompt_ids, offsets=self._transcript_offsets)
+                reconciled = reconcile_trail(reconciled, rows, prompt_ids, record=state.get(HOST_EFFECTS_KEY), declared=self.tool_keys)
+        except Exception as exc:  # noqa: BLE001 — the harness's own trail still stands
+            print(f'[plurai.child] errored tool calls could not be read from the CLI transcript: {type(exc).__name__}: {exc}', file=sys.stderr, flush=True)
+            return state
+        if reconciled is trail:
+            return state
+        return {**state, AGENT_STATE_TOOL_TRAIL_KEY: reconciled}
 
     @property
     def owned_types(self) -> frozenset[str] | None:
@@ -2740,6 +2808,7 @@ class _ChildSession:
         # without awaiting it). On a turn that returned, that end settles the CLI's own provider notes: a
         # retry that ended any other way supersedes an earlier provider stop.
         turn_end = await _await_cli_turn_end()
+        turn_queries = peek_cli_queries()  # taken below; the trail is reconciled against them
         # every infrastructure banner the CLI handed over this turn — the CLI's words, never the agent's
         infra_banners = [stop.last_assistant_message for stop in take_cli_stops() if not stop.ok and stop.error in INFRA_STOP_CLASSES]
         cli_notes = take_harness_faults_raised_by(STOP_FAILURE_SOURCE) if turn_end.settled else []
@@ -2780,6 +2849,9 @@ class _ChildSession:
             if not isinstance(exc, NoAssistantReplyError):
                 traceback.print_exc(file=sys.stderr)
             full_messages, agent_state = _error_trail(result)
+            # The turn that ends with no reply is the one most likely to hold errored calls no hook saw
+            # (a model retrying a tool the session does not have): its trail is reconciled too.
+            agent_state = self._with_unhooked_calls(agent_state, turn_queries)
             return AgentError(
                 kind='adapter',
                 subkind='no_assistant_reply' if isinstance(exc, NoAssistantReplyError) else 'reply_projection_failed',
@@ -2795,6 +2867,8 @@ class _ChildSession:
         # stays its reply. Infrastructure that ENDED the turn is typed on the side; a turn it left with nothing of
         # the agent's is the provider's whole turn.
         response = _without_cli_banners(response, infra_banners)
+        if (reconciled := self._with_unhooked_calls(response.agent_state, turn_queries)) is not response.agent_state:
+            response = replace(response, agent_state=reconciled)
         if infra is not None:
             if not response.ai_text.strip() and not response.agent_actions and (fault := _typed_as_infrastructure()) is not None:
                 return fault
@@ -2952,6 +3026,8 @@ class _ChildSession:
             unread_inputs=self._unread_record(),
             unread_parts=self._unread_parts_record(),
             interception_changed=interception_changed() or None,
+            # see plurai.clock (read, not taken: :func:`~plurai.clock.recorded_clock_delivery`)
+            clock_delivery=recorded_clock_delivery(self.thread_id) if self.thread_id else None,
         )
 
     def answered[R](self, reply: R) -> R:
@@ -2983,11 +3059,12 @@ class _ChildSession:
         return sorted({PurePosixPath(name).stem or name for name, spec in self._handed_parts if 'file_data' not in spec.read})
 
     def shutdown(self) -> None:
-        """Reset the active session id, turn context and unanswered-call record so a re-used interpreter doesn't leak."""
+        """Reset the active session id, turn context, unanswered-call and clock-delivery records so a re-used interpreter doesn't leak."""
         from plurai._mocking.resolution import take_unanswered_calls  # noqa: PLC0415
 
         if self.thread_id:
             take_unanswered_calls(self.thread_id)
+            take_clock_delivery(self.thread_id)
         # A stale turn would otherwise outlive the conversation — both in-process and
         # in the env any later child-spawned process inherits.
         set_current_turn(None)
@@ -3035,6 +3112,38 @@ _SPEND_CAP_ERROR = re.compile(
     r'^\W*(?:api error: 400\s+)?(?:(?:your )?credit balance is too low\b|you have reached your specified (?:workspace )?api usage limits\b)',
     re.IGNORECASE,
 )
+
+#: How much of an :class:`AgentFault`'s text, and how many ``{`` positions in it, are tried for the provider's error
+#: envelope (:func:`_embeds_spend_cap_envelope`).
+_ENVELOPE_SCAN_CHARS = 64 * 1024
+_ENVELOPE_SCAN_POSITIONS = 32
+
+
+def _embeds_spend_cap_envelope(text: str) -> bool:
+    """Whether an :class:`AgentFault`'s text embeds the provider's own spend-cap refusal, verbatim: the first JSON
+    object of the provider's error-envelope shape, ``{"type": "error", "error": {"type": <str>, "message": <str>}}``
+    (other keys, such as ``request_id``, allowed), whose message is the spend-cap sentence (:data:`_SPEND_CAP_ERROR`).
+
+    Each ``{`` is tried as the start of an object (a brace in the agent's own prefix cannot defeat it), bounded to
+    :data:`_ENVELOPE_SCAN_POSITIONS` positions in the first :data:`_ENVELOPE_SCAN_CHARS` characters. Only the
+    spend-cap sentence is read: a capacity reply (429/5xx) is the bridge's to type, and agent-controlled text widens
+    nothing else. An agent that rewords the provider's error stays the agent's."""
+    head = text[:_ENVELOPE_SCAN_CHARS]
+    decoder = json.JSONDecoder()
+    start = head.find('{')
+    for _ in range(_ENVELOPE_SCAN_POSITIONS):
+        if start < 0:
+            return False
+        try:
+            obj = decoder.raw_decode(head, start)[0]
+        except (ValueError, RecursionError):
+            obj = None
+        if isinstance(obj, dict) and obj.get('type') == 'error' and isinstance(error := obj.get('error'), dict):
+            kind, message = error.get('type'), error.get('message')
+            if isinstance(kind, str) and isinstance(message, str):
+                return bool(_SPEND_CAP_ERROR.match(message))
+        start = head.find('{', start + 1)
+    return False
 
 
 #: A channel kind → the session method that plants an entry of it (declare and dispatch). Keyed on the scan
@@ -3190,12 +3299,13 @@ def _invoke_raise_kind(exc: BaseException, *, harness_file: str | None, agent_st
     runtime failed the call; ``'agent_raised'`` (a failed trial the agent owns) when it was raised in the agent's
     own code, or is the runtime's error result on a turn whose last CLI stop the agent owns (``agent_stop``: its
     model's reply hit its output budget), or is a :class:`plurai.AgentFault` a harness raised on the agent's behalf
-    (read on the raise itself, never its chain); anything else (a harness bug, plurai) stays ``'other'``. Both but
-    ``agent_raised`` are errored."""
+    (read on the raise itself, never its chain) — unless its text embeds the provider's spend-cap envelope verbatim
+    (:func:`_embeds_spend_cap_envelope`), which is ``'provider_infra'``; anything else (a harness bug, plurai) stays
+    ``'other'``. Both but ``agent_raised`` are errored."""
     if _provider_unavailable(exc):
         return PROVIDER_INFRA_KIND
     if isinstance(exc, AgentFault):
-        return AGENT_RAISED_KIND
+        return PROVIDER_INFRA_KIND if _embeds_spend_cap_envelope(str(exc)) else AGENT_RAISED_KIND
     if agent_stop and _RUNTIME_SDK_RESULT in _lineage(exc):
         return AGENT_RAISED_KIND
     return AGENT_RAISED_KIND if _raised_in_agent_code(exc, harness_file=harness_file) else 'other'
@@ -3239,14 +3349,7 @@ def _step_capped(start: CliQueryStart) -> bool:
             lines = fh.read().decode('utf-8', 'replace').splitlines()
     except OSError:
         return False
-    rows: list[dict[str, Any]] = []
-    for line in lines:
-        try:
-            row = json.loads(line)
-        except ValueError:
-            continue  # the partial first line of the tail, or a row still being written
-        if isinstance(row, dict):
-            rows.append(row)
+    rows = list(_jsonl_dicts(lines))  # skips the partial first line of the tail, or a row still being written
     last = max((i for i, row in enumerate(rows) if row.get('promptId') == start.prompt_id), default=None)
     if last is None:
         return False
@@ -3626,15 +3729,20 @@ def _declared_owned_types(simulate_path: Path) -> frozenset[str] | None:
     return frozenset(declared) if declared is not None else None
 
 
-def _declared_live_tools(simulate_path: Path) -> frozenset[str]:
-    """``tools.<name>.mode`` ``real`` / ``observe``, plus ``agent.native_tools``, from the config beside this harness."""
-    names = set(_declared_native_tools(simulate_path))
-    for root in bench_config_roots(simulate_path):
-        for _path, document in discover_config_documents(root):
-            tools = document.get('tools')
-            if isinstance(tools, dict):
-                names |= {str(name) for name, entry in tools.items() if isinstance(entry, dict) and entry.get('mode') in ('real', 'observe')}
-    return frozenset(names)
+def _declared_tools(simulate_path: Path) -> tuple[frozenset[str], frozenset[str]]:
+    """``(live, keys)`` from the config beside this harness, in one read: ``live`` is ``tools.<name>.mode`` ``real`` /
+    ``observe`` plus ``agent.native_tools``, ``keys`` every ``tools:`` key."""
+    live: set[str] = set()
+    keys: set[str] = set()
+    for document in _config_documents(simulate_path.parent):
+        agent = document.get('agent')
+        native = agent.get('native_tools') if isinstance(agent, dict) else None
+        live |= {str(name) for name in native if name} if isinstance(native, list) else set()
+        tools = document.get('tools')
+        if isinstance(tools, dict):
+            keys |= {str(k) for k in tools if k}
+            live |= {str(name) for name, entry in tools.items() if isinstance(entry, dict) and entry.get('mode') in ('real', 'observe')}
+    return frozenset(live), frozenset(keys)
 
 
 # ---------------------------------------------------------------------------
