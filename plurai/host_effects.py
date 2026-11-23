@@ -45,7 +45,7 @@ import time
 from collections.abc import Awaitable, Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from urllib.parse import quote, unquote, urlparse
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any, Literal, cast
 
 from plurai._platform import is_windows
@@ -1960,6 +1960,93 @@ def _decoded_view(text: str) -> tuple[str, list[int] | None, list[int] | None]:
     return text, starts, ends
 
 
+#: The entries of a Windows ``Users`` folder that belong to no person, in lower case.
+_SHARED_WINDOWS_PROFILES = frozenset({'public', 'default', 'default user', 'all users', 'defaultuser0', 'desktop.ini'})
+
+#: The WSL settings file, where ``[automount] root`` may move the drives from ``/mnt/``.
+_WSL_CONF = Path('/etc/wsl.conf')
+
+#: The Windows homes found under WSL, once any was found: a listing that found none is tried again on the next rule.
+_WSL_HOMES: frozenset[str] | None = None
+
+
+def _folder_name(path: str) -> str:
+    """The last folder of ``path``, read the Windows way when it is a Windows path (``jane`` of ``C:\\Users\\jane``)."""
+    return PureWindowsPath(path).name if _windows_form(path) else Path(path).name
+
+
+def _mounted_forms(root: str, *, mounts: str = '/mnt/') -> tuple[str, ...]:
+    """``root``, a Windows path with a drive letter and ``/`` separators (``C:/Users/jane``), as the POSIX layers on Windows
+    spell it: WSL (``/mnt/c/Users/jane``, under ``mounts``), Git Bash and MSYS (``/c/Users/jane``) and Cygwin
+    (``/cygdrive/c/Users/jane``). A path without a drive letter (UNC, extended-length) or a bare drive has none."""
+    match = re.match(r'([A-Za-z]):/(.+)', root)
+    if not match or not match.group(2).strip('/'):
+        return ()
+    drive, rest = match.group(1).lower(), match.group(2).strip('/')
+    return (f'{mounts.rstrip("/")}/{drive}/{rest}', f'/{drive}/{rest}', f'/cygdrive/{drive}/{rest}')
+
+
+def _is_wsl() -> bool:
+    """Whether this Linux runs under WSL: its kernel names Microsoft, its interop is registered, or WSL set its variables
+    (``sudo``, cron and systemd services drop the variables, not the kernel)."""
+    if sys.platform != 'linux':
+        return False
+    if os.environ.get('WSL_DISTRO_NAME') or os.environ.get('WSL_INTEROP'):
+        return True
+    try:
+        return 'microsoft' in os.uname().release.lower() or Path('/proc/sys/fs/binfmt_misc/WSLInterop').exists()
+    except OSError:
+        return False
+
+
+def _wsl_mount_root() -> str:
+    """Where WSL mounts the Windows drives: ``[automount] root`` of :data:`_WSL_CONF`, else ``/mnt/``."""
+    import configparser  # noqa: PLC0415 - read only under WSL
+
+    try:
+        conf = configparser.ConfigParser(strict=False, interpolation=None)
+        conf.read_string(_WSL_CONF.read_text(encoding='utf-8', errors='replace'))
+        root = conf.get('automount', 'root', fallback='/mnt/').strip().strip('"\'')
+    except (OSError, configparser.Error):
+        return '/mnt/'
+    return root if root.startswith('/') else '/mnt/'
+
+
+def _wsl_windows_homes() -> frozenset[str]:
+    """Under WSL, the Windows home of each person on a mounted drive (``C:/Users/jane`` for ``/mnt/c/Users/jane``), so a
+    path in it is a known root there too. Empty anywhere else. One listing of each drive's ``Users`` folder, nothing
+    deeper; kept for the process once it found a home. An entry that cannot be read is kept as a home: a root too many
+    replaces a path that is not the user's, a root too few sends one that is."""
+    global _WSL_HOMES  # noqa: PLW0603 - a per-process memo that a listing which found nothing does not set
+    if _WSL_HOMES is not None:
+        return _WSL_HOMES
+    if not _is_wsl():
+        return frozenset()
+    mounts = Path(_wsl_mount_root())
+    homes: set[str] = set()
+    try:
+        drives = [d for d in mounts.iterdir() if len(d.name) == 1 and d.name.isalpha()]
+    except OSError:
+        return frozenset()
+    for drive in drives:
+        try:
+            entries = list((drive / 'Users').iterdir())
+        except OSError:
+            continue
+        for entry in entries:
+            if entry.name.lower() in _SHARED_WINDOWS_PROFILES:
+                continue
+            try:
+                if not entry.is_dir():
+                    continue
+            except OSError:
+                pass
+            homes.add(f'{drive.name.upper()}:/Users/{entry.name}')
+    if homes:
+        _WSL_HOMES = frozenset(homes)
+    return frozenset(homes)
+
+
 @functools.lru_cache(maxsize=1)
 def _interpreter_roots() -> tuple[tuple[str, ...], tuple[str, ...]]:
     """The folders this interpreter lives in (its prefixes) and the ones it imports packages from (``site-packages``), read
@@ -2001,8 +2088,13 @@ class _HomeSpellings:
 
     @property
     def dashed(self) -> frozenset[str]:
-        """The home with its slashes written as hyphens (``-Users-jane``), for a home of two folders or more."""
-        return frozenset(h.replace('/', '-') for h in self.forms if h.count('/') >= 2)
+        """The home with its slashes written as hyphens (``-Users-jane``), for a home of two folders or more; a Windows home
+        also with its drive (``C--Users-jane``), as a tool names a folder after it there, and a space in it also as a hyphen
+        (``C--Users-Jane-Doe``)."""
+        slashed = {h.replace('\\', '/') for h in self.forms}
+        drives = {f'{h[0]}-' + h[2:].replace('/', '-') for h in slashed if re.match(r'[A-Za-z]:/', h) and h.count('/') >= 2}
+        dashed = {h.replace('/', '-') for h in slashed if h.startswith('/') and h.count('/') >= 2} | drives
+        return frozenset(dashed | {d.replace(' ', '-') for d in dashed})
 
     @property
     def tails(self) -> frozenset[str]:
@@ -2011,10 +2103,14 @@ class _HomeSpellings:
 
 
 @functools.lru_cache(maxsize=32)
-def _roots_pattern(posix: frozenset[str], windows: frozenset[str], home: _HomeSpellings, *, fold: bool) -> re.Pattern[str]:
+def _roots_pattern(
+    posix: frozenset[str], windows: frozenset[str], home: _HomeSpellings, *, fold: bool, mounted: frozenset[str] = frozenset()
+) -> re.Pattern[str]:
     """The one pattern that finds a spelling of a known root in a text, as the named group that says which kind:
 
     * ``windows`` — a root with a drive, either separator, any case, and an extended-length prefix;
+    * ``mounted`` — a Windows home as WSL, Git Bash, MSYS or Cygwin spell it (``/mnt/c/Users/jane``), in any case, as the
+      drive reads it;
     * ``deep`` — a root of two folders or more (``/Users/jane``), found anywhere, glued to a word included;
     * ``shallow`` — a root of one folder (``/root``, ``/app``), which is also an ordinary segment of a relative path or a
       URL (``https://pypi.org/simple/root/``): found only where it does not follow a word character, ``.``, ``~`` or ``-``;
@@ -2038,6 +2134,9 @@ def _roots_pattern(posix: frozenset[str], windows: frozenset[str], home: _HomeSp
     if windows:
         forms = [r'[\\/]+'.join(re.escape(segment) for segment in w.split('/') if segment) for w in sorted(windows, key=lambda w: (-len(w), w))]
         parts.append(rf'(?P<windows>(?<![\w.~$/\\-])(?:\\\\[?.]\\)?(?i:{"|".join(forms)}){end})')
+    if mounted:
+        forms = '|'.join(_root_form(r) for r in sorted(mounted, key=lambda r: (-len(r), r)))
+        parts.append(rf'(?P<mounted>(?<![\w.~-])(?i:{forms})){end}')
     if deep := [r for r in posix if r.count('/') > 1]:
         parts.append(rf'(?P<deep>{posix_forms(deep)}){end}')
     if shallow := [r for r in posix if r.count('/') == 1]:
@@ -2049,7 +2148,7 @@ def _roots_pattern(posix: frozenset[str], windows: frozenset[str], home: _HomeSp
         names = f'~{_alternation(home.names)}(?!\\w)|' if home.names else ''
         parts.append(rf'(?P<tilde>(?<![\w.~$/\\-])(?:~(?=[\\/])|{names}\$\{{HOME\}}(?!\w)|\$HOME(?!\w)))')
     if dashed := home.dashed:
-        parts.append(rf'(?P<dashed>(?<![\w-]){_alternation(dashed)})(?=-|(?![\w.]))')
+        parts.append(rf'(?P<dashed>(?<![\w-]){case.format(_alternation(dashed))})(?=-|(?![\w.]))')
     return re.compile('|'.join(parts))
 
 
@@ -2074,7 +2173,7 @@ class _Shippable:
         self.project_forms: tuple[str, ...] = ()
         self.project_windows = ''
         home_real = _realpath(home)
-        self.user_names = frozenset({home.name, Path(home_real).name} - {''}) if home.parent != home else frozenset()
+        self.user_names = frozenset({_folder_name(str(home)), _folder_name(home_real)} - {''}) if home.parent != home else frozenset()
         project_path = _absolute(project) if project is not None else None
         if project_path is not None and not self._holds_a_home(project_path, home_real):
             self.project_forms = tuple(dict.fromkeys((*_forms(project_path), _realpath(project_path))))
@@ -2092,9 +2191,26 @@ class _Shippable:
         spellings = {form for folder in folders for form in _forms(folder)} | set(self.project_forms)
         home_forms = frozenset(self.scope._home_forms) - {'/'} if self.user_names else frozenset()  # noqa: SLF001
         self.site_dirs: tuple[str, ...] = tuple(dict.fromkeys(_windows_form(f) or f for site in sites for f in _forms(Path(site))))
-        windows = {_windows_form(f) for f in spellings if re.match(r'[A-Za-z]:', f) and _windows_form(f)} | ({self.project_windows} - {''})
+        # A Windows home (``C:\Users\jane``) is a drive form like a Windows project, so it joins the Windows roots; under
+        # WSL the Windows home of each person on a mounted drive joins them too. The home's mounted spellings (``/mnt/c/…``,
+        # ``/c/…``, ``/cygdrive/c/…``) are matched in any case, as the drive is, and its drive-less form (``/Users/jane``)
+        # is a root of its own, which reads the current-drive spelling (``\Users\jane``) and gives the tail and dashed
+        # spellings a POSIX home has. Other Windows roots get no mounted spelling: a short one (``/c/src``) is an ordinary
+        # piece of a relative path or a URL. A machine with a Windows home reads its paths without case, as Windows does.
+        try:
+            wsl_homes = _wsl_windows_homes()
+        except Exception:  # noqa: BLE001 - reading the machine never fails the rule
+            wsl_homes = frozenset()
+        home_windows = {_windows_form(f) for f in home_forms if re.match(r'[A-Za-z]:', f) and _windows_form(f)} | wsl_homes
+        windows = {_windows_form(f) for f in spellings if re.match(r'[A-Za-z]:', f) and _windows_form(f)} | ({self.project_windows} - {''}) | home_windows
         posix = {f for f in spellings | home_forms if f not in ('', '/') and not (re.match(r'[A-Za-z]:', f) and _windows_form(f))}
-        self.pattern = _roots_pattern(frozenset(posix), frozenset(windows), _HomeSpellings(home_forms, self.user_names), fold=_CASE_FOLDING)
+        driveless = {'/' + w[2:].strip('/') for w in home_windows if w[2:].strip('/').count('/') >= 1}
+        posix |= driveless
+        mounts = _wsl_mount_root() if wsl_homes else '/mnt/'
+        mounted = frozenset(form for root in home_windows for form in _mounted_forms(root, mounts=mounts))
+        home_spelled = home_forms | driveless
+        spelled = _HomeSpellings(frozenset(home_spelled), self.user_names)
+        self.pattern = _roots_pattern(frozenset(posix), frozenset(windows), spelled, fold=_CASE_FOLDING or bool(home_windows), mounted=mounted)
 
     def _holds_a_home(self, project: Path, home_real: str) -> bool:
         """Whether a path relative to ``project`` could spell the user: it is the home folder, a folder above it
@@ -2298,7 +2414,10 @@ def shippable_text(obj: Any, *, project: str | Path | None) -> Any:
 
     The rule for texts the SDK writes (an error, a summary, a log line), always on. It knows the folders this machine
     owns, its known roots: the home, the project, the working folder, the temporary folder and the prefixes and
-    ``site-packages`` folders of the running interpreter, each as written and resolved. It finds a spelling of one in a
+    ``site-packages`` folders of the running interpreter, each as written and resolved, and under WSL the Windows home of
+    each person on a mounted drive (``/mnt/c/Users/jane``). A Windows home is also found in its current-drive spelling
+    (``\\Users\\jane``) and as WSL, Git Bash, MSYS and Cygwin spell it (``/mnt/c/Users/jane``, ``/c/Users/jane``,
+    ``/cygdrive/c/Users/jane``), in any case. It finds a spelling of one in a
     text (the root as a path, as ``~``, ``~<user>``, ``$HOME`` or ``${HOME}``, as a ``file:`` URL, with a drive and either
     separator on Windows, JSON-escaped, ``\\u002f``-escaped or percent-encoded) and replaces the path from there to its
     end:
@@ -2315,7 +2434,7 @@ def shippable_text(obj: Any, *, project: str | Path | None) -> Any:
       (``<stand-in>langgraph/pregel/main.py``) when that part is a plain package path (no empty, ``.`` or ``..``
       segment, no space, no outage word, no user name);
     * every other byte of a text ships as it was. That includes any path that is under no known root (``/opt/data/x.csv``,
-      another user's home), URLs and routes (``/api/orders/42``), template advice (``<out>/<scenario>/transcript.json``)
+      another user's home outside WSL), URLs and routes (``/api/orders/42``), template advice (``<out>/<scenario>/transcript.json``)
       and relative paths. Residual, accepted: such a path names a place of this machine and is sent as written; the rule
       does not guess from the shape of a text what is a path;
     * a spelling of a root is exact, not guessed: a drive letter, a rooted backslash and mixed or doubled separators
