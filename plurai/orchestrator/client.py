@@ -264,6 +264,13 @@ def eval_set_policy_names(answer: EvalSetPoliciesResponse, eval_set_id: str) -> 
     return answer.policies
 
 
+#: Read timeout of the finalize poll GET, in seconds. httpx counts a read timeout per read, so it bounds the silence
+#: between two chunks of the answer, not the whole answer: a done poll of up to 114 KB on a slow link keeps arriving
+#: chunk by chunk and never reaches it, while a poll left unanswered (a connection that went stale across a laptop
+#: sleep) is retried after this long instead of after the client's 1200 second read timeout.
+FINALIZE_POLL_READ_TIMEOUT_SECONDS = 30.0
+
+
 class OrchestratorClient:
     """Async wrapper around the backend orchestration REST API."""
 
@@ -282,7 +289,7 @@ class OrchestratorClient:
             # On every request, not only the ones that create a thread or a job: the label is the client's,
             # and one client serves one command.
             headers[command_run.HEADER] = command_run_id
-        # One READ timeout for every request. It is set generously (see
+        # One READ timeout for every request but the finalize poll GET (see FINALIZE_POLL_READ_TIMEOUT_SECONDS). It is set generously (see
         # NetworkSettings.http_timeout) because POST /user-turn legitimately sits near it —
         # an LLM user-simulator turn plus the per-turn judges. NOT because of /finalize:
         # that is submit + poll (finalize_async_submit / finalize_job_status), so each call
@@ -301,6 +308,14 @@ class OrchestratorClient:
             headers=headers,
         )
         self._retry = retry if retry is not None else RetryConfig()
+        # The client's timeouts with the read timeout cut to FINALIZE_POLL_READ_TIMEOUT_SECONDS (never raised above the client's own).
+        base = self._client.timeout
+        self._finalize_poll_timeout = httpx.Timeout(
+            connect=base.connect,
+            read=FINALIZE_POLL_READ_TIMEOUT_SECONDS if base.read is None else min(base.read, FINALIZE_POLL_READ_TIMEOUT_SECONDS),
+            write=base.write,
+            pool=base.pool,
+        )
         # thread id -> (served ``<scheme>:///documents/…`` reference -> the ``data:`` URI folded from it).
         self._served: dict[str, dict[str, str]] = {}
 
@@ -740,14 +755,15 @@ class OrchestratorClient:
         """GET /threads/{id}/finalize/jobs/{job_id} → typed ``FinalizeJobStatusResponse``.
 
         A 404 (job evicted / unknown) raises ``httpx.HTTPStatusError`` and propagates
-        to the caller. Marked idempotent so ``ReadTimeout`` on the poll GET is retried.
+        to the caller. Marked idempotent so ``ReadTimeout`` on the poll GET is retried; the GET has its own
+        short read timeout (:data:`FINALIZE_POLL_READ_TIMEOUT_SECONDS`).
 
         Raises ``pydantic.ValidationError`` when the server returns an unrecognized
         ``status`` value (schema drift). The caller (``_finalize_async``) catches and
         converts to ``OrchestratorAdapterError``.
         """
         response = await self._request_with_retry(
-            lambda: self._client.get(f'/threads/{thread_id}/finalize/jobs/{job_id}'),
+            lambda: self._client.get(f'/threads/{thread_id}/finalize/jobs/{job_id}', timeout=self._finalize_poll_timeout),
             idempotent=True,
             endpoint='/threads/{id}/finalize/jobs/{job_id}',
         )

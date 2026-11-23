@@ -1626,6 +1626,13 @@ def _thread_stem(source_path: Path) -> str:
     return Path(readers.inner_name(source_path.name)).stem
 
 
+def _is_langfuse_export(raw: Any) -> bool:
+    """A Langfuse export file: one trace object carrying an ``observations`` tree, or a non-empty JSON array of them (a conversation)."""
+    if isinstance(raw, dict):
+        return 'observations' in raw
+    return isinstance(raw, list) and bool(raw) and all(isinstance(item, dict) and 'observations' in item for item in raw)
+
+
 def _langsmith_front_end(source_path: Path) -> SourceProjection:
     """The FIRST-CLASS front end: a LangSmith thread export → its source-shaped projection.
 
@@ -1642,13 +1649,14 @@ def _langsmith_front_end(source_path: Path) -> SourceProjection:
     except json.JSONDecodeError as e:
         raise TraceConversionError(f'{source}: not parseable JSON ({e}). A thread export is a JSON list of LangSmith run dicts.') from e
 
-    if isinstance(raw, dict) and 'observations' in raw:
-        # `ingest-traces` writes Langfuse traces into the same `traces/<trace_id>.json` layout, so
-        # this default reader meets them. Named, because "a dict is not a list" sends the operator
-        # hunting for a malformed LangSmith export that does not exist.
+    if _is_langfuse_export(raw):
+        # `ingest-traces` writes Langfuse traces into the same `traces/` layout, so this default
+        # reader meets them. Named, because "a dict is not a list" (or a trace object read as a run
+        # with no output state) sends the operator hunting for a malformed LangSmith export that
+        # does not exist.
         raise FormatUnsupportedError(
-            f'{source}: is a Langfuse trace (a trace object carrying an "observations" tree), and no reader converts '
-            'Langfuse yet. This reader takes a LangSmith thread export — a JSON list of run dicts.',
+            f'{source}: is a Langfuse trace (a trace object carrying an "observations" tree, or a JSON array of them), and no reader '
+            'converts Langfuse yet. This reader takes a LangSmith thread export — a JSON list of run dicts.',
             convention='langfuse',
         )
     if not isinstance(raw, list):

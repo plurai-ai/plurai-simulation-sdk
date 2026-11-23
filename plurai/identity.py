@@ -29,15 +29,16 @@ from __future__ import annotations
 import hashlib
 import logging
 import subprocess
+from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass
 from functools import cache
 from pathlib import Path
-from typing import Any
+from typing import Any, Final
 
 from plurai._platform import utf8_child_text
 
-__all__ = ['sdk_identity', 'sdk_identity_line']
+__all__ = ['recorded_sdk_identity', 'sdk_identity', 'sdk_identity_line']
 
 logger = logging.getLogger(__name__)
 
@@ -128,9 +129,10 @@ def _contract() -> dict[str, Any]:
 
 @cache
 def _cached_identity() -> dict[str, Any]:
-    """The memoised derivation — see :func:`sdk_identity`, which is what callers use. Its ``path``
-    reaches the artifacts and the upload, so it is written the way everything leaving the machine
-    is (:func:`plurai.host_effects.scrub_parent_record`): from ``~``, never naming the operator."""
+    """The memoised derivation — see :func:`sdk_identity`, which is what callers use. Its ``path`` is
+    printed by :func:`sdk_identity_line` and ``plurai capabilities``, so it is written from ``~``
+    (:func:`plurai.host_effects.scrub_parent_record`), never naming the operator. Artifacts and uploads
+    record :func:`recorded_sdk_identity`, which has no path."""
     from plurai.host_effects import scrub_parent_record  # noqa: PLC0415 - leaf read, kept lazy like _contract
 
     package = Path(__file__).resolve().parent
@@ -140,10 +142,10 @@ def _cached_identity() -> dict[str, Any]:
 def sdk_identity() -> dict[str, Any]:
     """WHICH SDK is running, derived from :data:`plurai.__file__`. Derived once per process.
 
-    Memoised because it shells out to git and can walk the package tree: this is stamped into
-    ``run_summary.json``, every ``transcript.json.metadata`` and the ingest provenance, and
-    several subprocess round-trips per scenario would be paid for an answer that cannot change
-    inside one process. Returns a plain dict — it is JSON on the way to an artifact, and a model
+    Memoised because it shells out to git and can walk the package tree: it is the source of the
+    identity stamped (without ``path``, through :func:`recorded_sdk_identity`) into ``run_summary.json``,
+    every ``transcript.json.metadata`` and the ingest provenance, and several subprocess round-trips per
+    scenario would be paid for an answer that cannot change inside one process. Returns a plain dict — it is JSON on the way to an artifact, and a model
     here would make every reader import the SDK to read a run it already has on disk.
 
     A FRESH copy each call, ``contract`` included. The memoised value is stamped into every
@@ -151,6 +153,24 @@ def sdk_identity() -> dict[str, Any]:
     edit retroactively true of every artifact written after it.
     """
     return deepcopy(_cached_identity())
+
+
+#: The identity keys that describe this machine and not the SDK build.
+_MACHINE_LOCAL_KEYS: Final = frozenset({'path'})
+
+
+def without_machine_keys(identity: Mapping[str, Any]) -> dict[str, Any]:
+    """``identity`` without the keys that describe this machine and not the SDK build."""
+    return {key: value for key, value in identity.items() if key not in _MACHINE_LOCAL_KEYS}
+
+
+def recorded_sdk_identity() -> dict[str, Any]:
+    """:func:`sdk_identity` as a run artifact or an upload records it: the build, without where it is installed.
+
+    The install path names a folder on the operator's machine. ``commit`` + ``dirty`` identify a git
+    install and ``file_hash`` a distribution, so the path adds nothing a reader on another machine can use.
+    """
+    return without_machine_keys(sdk_identity())
 
 
 def _identity_for(package: Path) -> dict[str, Any]:

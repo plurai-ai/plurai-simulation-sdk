@@ -209,6 +209,22 @@ def require_expected_sha256(entry: PartEntry, expected: str) -> None:
         raise PartMismatchError(f'{entry.title} is {entry.sha256} but the approved plan named {expected}; nothing was uploaded')
 
 
+def require_expected_sha256_in_order(entries: Sequence[PartEntry], expected: Sequence[str]) -> None:
+    """Raise :class:`PartMismatchError` unless the parts built are exactly the ones the plan named, in the same order.
+
+    A multi-part export packs the same way on every run, so the plan's hashes are compared position by position; a
+    different count of parts is a mismatch too. The message states every difference.
+    """
+    problems: list[str] = []
+    if len(entries) != len(expected):
+        problems.append(f'{len(entries)} part(s) were built but the approved plan named {len(expected)}')
+    for index, (entry, digest) in enumerate(zip(entries, expected, strict=False), start=1):
+        if entry.sha256 != digest:
+            problems.append(f'{entry.title} part {index} is {entry.sha256} but the approved plan named {digest}')
+    if problems:
+        raise PartMismatchError('; '.join(problems) + '; nothing was uploaded')
+
+
 def require_expected_sha256_by_name(entries: Sequence[PartEntry], expected: Mapping[str, str]) -> None:
     """Raise :class:`PartMismatchError` unless the parts built are exactly the ones the plan named, matched by name.
 
@@ -308,6 +324,7 @@ __all__ = [
     'planned_entry',
     'require_expected_sha256',
     'require_expected_sha256_by_name',
+    'require_expected_sha256_in_order',
     'render_parts_disclosure',
     'sha256_argument',
     'sha256_of',

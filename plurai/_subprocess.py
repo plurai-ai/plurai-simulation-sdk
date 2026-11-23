@@ -69,7 +69,7 @@ from plurai.agent_io import DEFAULT_AGENT_IO, AgentIO, declared_agent_io
 from plurai.child_env import launch_environment
 from plurai.capacity import capacity_block_from_body, unavailable_block_from_record
 from plurai.credit import credit_block_from_body
-from plurai.host_effects import redact_cli_credentials, scrub_parent_record
+from plurai.host_effects import harness_project, redact_cli_credentials, shipped_error
 from plurai.settings import FULL_RUN_AGENT_TURN_TIMEOUT
 
 
@@ -479,13 +479,14 @@ class ChildProcess:
         ``unexecutable`` itself, so the server is told rather than left to guess.
         """
         if user_message is None and not self._declared_io().may_open:
-            raise OrchestratorAdapterError(
+            raise shipped_error(
+                lambda message: OrchestratorAdapterError(message, thread_id=self._known_thread_id),
                 f'refusing to drive turn {turn_idx + 1} with an EMPTY OPENER on thread {self._thread_id}: '
                 f'{self.simulate_path} does not declare `agent.io: {{may_open: true}}` in its plurai.config.yaml. '
                 f'An agent that opens the conversation is called with `{{"messages": []}}` on turn 0, which a harness that '
                 f'never declared it would raise on. Declare it (and make invoke_agent greet on an empty message list), or '
                 f'let the scenario set supply the first turn.',
-                thread_id=None if self._thread_id == _UNINITIALIZED_THREAD_ID else self._thread_id,
+                project=self._shipping_project,
             )
         sent_action = user_action if self._child_applies_user_actions else None
         unsent = None if user_action is None or sent_action is not None else _UNEXECUTABLE_BY_AN_OLDER_CHILD | {'turn_idx': user_action.get('turn_idx')}
@@ -679,41 +680,57 @@ class ChildProcess:
             return response
         if isinstance(response, PipelineError):
             if response.kind == 'mock_runtime_fault':
-                raise MockRuntimeFaultRaised(
-                    f'mock runtime fault during invoke_pipeline on thread {self._thread_id}: {response.exc_class}: {response.message}',
-                    transient=response.transient is True,
-                    cause=response.message,
-                    route_cause=response.route_cause,
-                    credit=credit_block_from_body(response.credit),
-                    capacity=capacity_block_from_body(response.capacity),
-                    unavailable=unavailable_block_from_record(response.unavailable),
-                    child_exc_class=response.exc_class,
-                    thread_id=self._thread_id,
+                raise self._shipped_pipeline_fault(
+                    response,
+                    lambda r: MockRuntimeFaultRaised(
+                        f'mock runtime fault during invoke_pipeline on thread {self._thread_id}: {r.exc_class}: {r.message}',
+                        transient=r.transient is True,
+                        cause=r.message,
+                        route_cause=r.route_cause,
+                        credit=credit_block_from_body(r.credit),
+                        capacity=capacity_block_from_body(r.capacity),
+                        unavailable=unavailable_block_from_record(r.unavailable),
+                        child_exc_class=r.exc_class,
+                        thread_id=self._thread_id,
+                    ),
                 )
             if response.kind == PROVIDER_INFRA_KIND:
-                raise _provider_infra(f'pipeline_invoke failed on thread {self._thread_id}', response, thread_id=self._thread_id)
+                raise self._shipped_pipeline_fault(
+                    response, lambda r: _provider_infra(f'pipeline_invoke failed on thread {self._thread_id}', r, thread_id=self._thread_id)
+                )
             if response.kind == 'harness_fault':
                 # The harness's own refusal, never an agent outcome: typed so error.json reads not_valid.
-                raise HarnessFaultRaised(
-                    f'harness fault during invoke_pipeline on thread {self._thread_id}: {response.exc_class}: {response.message}',
-                    child_exc_class=response.exc_class,
-                    child_message=response.message,
-                    thread_id=self._thread_id,
+                raise self._shipped_pipeline_fault(
+                    response,
+                    lambda r: HarnessFaultRaised(
+                        f'harness fault during invoke_pipeline on thread {self._thread_id}: {r.exc_class}: {r.message}',
+                        child_exc_class=r.exc_class,
+                        child_message=r.message,
+                        thread_id=self._thread_id,
+                    ),
                 )
-            raise OrchestratorAdapterError(
-                f'pipeline_invoke failed on thread {self._thread_id}: '
-                f'{response.exc_class}: {response.message}' + (' [timed out]' if response.timed_out else ''),
-                # Structured attrs so consumers (local_runner's
-                # pipeline_error dict) can filter / route by the
-                # CHILD-side exception class without parsing the message
-                # text. Without these, every pipeline crash looks like
-                # OrchestratorAdapterError in error.json regardless of
-                # the actual underlying failure.
-                child_exc_class=response.exc_class,
-                child_message=response.message,
-                timed_out=response.timed_out,
+            # Structured attrs so consumers (local_runner's pipeline_error dict) can filter / route by the CHILD-side
+            # exception class without parsing the message text. Without these, every pipeline crash looks like
+            # OrchestratorAdapterError in error.json regardless of the actual underlying failure.
+            raise self._shipped_pipeline_fault(
+                response,
+                lambda r: OrchestratorAdapterError(
+                    f'pipeline_invoke failed on thread {self._thread_id}: {r.exc_class}: {r.message}' + (' [timed out]' if r.timed_out else ''),
+                    child_exc_class=r.exc_class,
+                    child_message=r.message,
+                    timed_out=r.timed_out,
+                ),
             )
         raise RuntimeError(f'unexpected child response to pipeline_invoke: {type(response).__name__}')
+
+    def _shipped_pipeline_fault[E: BaseException](self, response: PipelineError, build: Callable[[PipelineError], E]) -> E:
+        """``build(response)`` with the child's message as :func:`~plurai.host_effects.shippable_text` writes it.
+
+        The exception is what the ``/fail`` body, ``error.json`` and the transcript's failure metadata read, so the message and
+        the ``cause`` it ends in come from one rewritten string. The operator's terminal reads the message as the child wrote it
+        (:func:`~plurai.host_effects.local_text_of`).
+        """
+        return shipped_error(lambda message: build(replace(response, message=message)), response.message, project=self._shipping_project)
 
     # ----- internals ---------------------------------------------------------
 
@@ -738,7 +755,7 @@ class ChildProcess:
                 envelope_type=msg.type,
                 direction='sent',
                 limit=IPC_LINE_LIMIT_BYTES,
-                thread_id=None if self._thread_id == _UNINITIALIZED_THREAD_ID else self._thread_id,
+                thread_id=self._known_thread_id,
             )
         try:
             proc.stdin.write(line)
@@ -752,12 +769,16 @@ class ChildProcess:
             # would reach ``error.json`` as an agent verdict half the time.
             await self._proc_wait_brief()
             await self._drain_stderr_briefly()
-            raise HarnessChildExited(
+            raise shipped_error(
+                lambda message: HarnessChildExited(
+                    message,
+                    returncode=proc.returncode,
+                    envelope_type=msg.type,
+                    thread_id=self._known_thread_id,
+                ),
                 f'child subprocess closed stdin before {msg.type} could be sent '
                 f'(returncode={proc.returncode}){_child_death_hint(proc.returncode)}: {exc}{self._stderr_tail_block()}',
-                returncode=proc.returncode,
-                envelope_type=msg.type,
-                thread_id=None if self._thread_id == _UNINITIALIZED_THREAD_ID else self._thread_id,
+                project=self._shipping_project,
             ) from exc
 
         return await self._await_response_or_exit(timeout=timeout, envelope_type=msg.type)
@@ -788,7 +809,7 @@ class ChildProcess:
                     envelope_type=envelope_type,
                     direction='received',
                     limit=result.limit,
-                    thread_id=None if self._thread_id == _UNINITIALIZED_THREAD_ID else self._thread_id,
+                    thread_id=self._known_thread_id,
                 )
             if isinstance(result, _DecodeFailure):
                 # Stray non-JSON output (typically a customer ``print(...)``
@@ -808,12 +829,16 @@ class ChildProcess:
             # TYPED, because an untyped raise here is indistinguishable from the agent
             # crashing: the runner stamps ``kind`` off the raising class, and without one a
             # reaped child reaches the report and the suite critic as an agent verdict.
-            raise HarnessChildExited(
+            raise shipped_error(
+                lambda message: HarnessChildExited(
+                    message,
+                    returncode=proc.returncode,
+                    envelope_type=envelope_type,
+                    thread_id=self._known_thread_id,
+                ),
                 f'child subprocess exited with code {proc.returncode} before responding to '
                 f'{envelope_type}{_child_death_hint(proc.returncode)}{self._stderr_tail_block()}',
-                returncode=proc.returncode,
-                envelope_type=envelope_type,
-                thread_id=None if self._thread_id == _UNINITIALIZED_THREAD_ID else self._thread_id,
+                project=self._shipping_project,
             )
         # Timeout — kill the child so it doesn't outlive the parent.
         await self._kill()
@@ -851,10 +876,47 @@ class ChildProcess:
             f'agent turn exceeded {timeout}s on thread {self._thread_id} (envelope={envelope_type!r}); child was terminated.{hint}',
             envelope_type=envelope_type,
             budget_seconds=timeout,
-            thread_id=None if self._thread_id == _UNINITIALIZED_THREAD_ID else self._thread_id,
+            thread_id=self._known_thread_id,
         )
 
+    @property
+    def _shipping_project(self) -> Path | None:
+        """The project a shipped error text writes its paths relative to, or ``None`` when it cannot be read.
+
+        Read on the failure path, so it never raises: with no project the rule ships every local path as the stand-in.
+        """
+        try:
+            return harness_project(self.simulate_path)
+        except (AttributeError, OSError, ValueError):
+            return None
+
+    @property
+    def _known_thread_id(self) -> str | None:
+        """The server's thread id, or ``None`` before the child is initialised: the placeholder never outranks the real id."""
+        return None if self._thread_id == _UNINITIALIZED_THREAD_ID else self._thread_id
+
     def _raise_for_error(self, err: InitError | AgentError, *, turn_idx: int) -> NoReturn:
+        """Raise what the child's error envelope names, with every text as :func:`~plurai.host_effects.shippable_text` writes it.
+
+        The exception is what the ``/fail`` body, ``error.json`` and the transcript's failure metadata read, so the child's
+        message is rewritten once, here: a path under the project is written relative to it and any other local path is the
+        stand-in. The message and the ``cause`` it ends in come from one rewritten string, so the re-drive check that the
+        original error ends with the cause still holds. The operator's terminal reads the message as the child wrote it
+        (:func:`~plurai.host_effects.local_text_of`).
+        """
+        raise shipped_error(
+            lambda message: self._exception_for_error(replace(err, message=message), turn_idx=turn_idx),
+            err.message,
+            project=self._shipping_project,
+        )
+
+    def _exception_for_error(self, err: InitError | AgentError, *, turn_idx: int) -> Exception:
+        try:
+            self._raise_for_shipped_error(err, turn_idx=turn_idx)
+        except Exception as exc:
+            return exc
+
+    def _raise_for_shipped_error(self, err: InitError | AgentError, *, turn_idx: int) -> NoReturn:
         if isinstance(err, InitError) and err.kind == 'mock_unreachable':
             # Connect-mode mock could not be reached/verified by
             # ``plurai.configure(...)`` in the child. This is an actionable
@@ -1075,15 +1137,15 @@ class ChildProcess:
         Shared by both child-death raises: a child reaped by the OS writes nothing, so the block
         is empty there and the returncode's sign carries the classification instead.
 
-        The message goes on to ``error.json`` (an upload member), the ``/fail`` body and the
-        re-drive record, and a traceback's frames spell paths through the home: scrubbed here,
-        with the harness's repo (the root above the harness) allowed. Credential values were
-        redacted as each line was read (:meth:`_read_stderr`).
+        The block is the child's text as written: a traceback's frames and a refusal's sentence spell
+        local paths. The raise site writes the whole message with :func:`~plurai.host_effects.shipped_error`, so
+        ``error.json`` (an upload member), the ``/fail`` body and the re-drive record hold the shipped text
+        while the operator's terminal keeps the paths. Credential values were redacted as each line was read
+        (:meth:`_read_stderr`).
         """
         tail = '\n'.join(self._stderr_tail).rstrip()
         if not tail:
             return ''
-        tail = scrub_parent_record(tail, repo=Path(os.path.normpath(self.simulate_path.absolute())).parent.parent)
         return f'\n--- last child stderr ---\n{tail}\n--- end stderr ---'
 
     async def _proc_wait_brief(self) -> None:

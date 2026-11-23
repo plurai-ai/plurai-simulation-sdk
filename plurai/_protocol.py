@@ -115,6 +115,10 @@ class OrchestratorAdapterError(RuntimeError):
     #: Typed failure slug, set by the raising class. See the class docstring.
     kind: ClassVar[str | None] = None
 
+    #: Whether the runner tells the server the thread failed (``/fail``) when this error ends a scenario. ``False`` for an
+    #: error raised about a thread the server already finished: ``/fail`` would state something false about it.
+    sends_fail: ClassVar[bool] = True
+
     def __init__(
         self,
         message: str = '',
@@ -157,6 +161,33 @@ class FinalizePollTimeout(OrchestratorAdapterError):  # noqa: N818  # frozen pub
 
     def __init__(self, message: str, *, thread_id: str, job_id: str) -> None:
         super().__init__(message, thread_id=thread_id, timed_out=True)
+        self.job_id = job_id
+
+
+#: What the customer reads when a scored conversation's result is gone from the server. One sentence for what happened, one
+#: for what to do; no id, no status and nothing of the backend's state.
+RESULT_EXPIRED_TEXT: Final = 'This conversation finished and was scored, but its result expired before it could be read. Run it again to get a result.'
+
+
+class FinalizeResultExpired(OrchestratorAdapterError):  # noqa: N818  # sibling of the frozen public names above
+    """Raised when the finalize poll answers 404 for a thread the server reports ``completed``.
+
+    The conversation finished and was scored; only the stored result is gone. It is typed apart from
+    :class:`FinalizeJobFailed` and from the raw 404 because the right handling differs from both: no ``/fail`` (the
+    thread did not fail), no re-drive (a second run pays for the conversation and the judges again), and a customer
+    text that says the result expired. :func:`~plurai.orchestrator.redrive.classify_restart_failure` never reads it as a
+    restart: a thread that answers is not gone.
+    """
+
+    #: A server-side fact (the result's retention ended), never the agent's: not a ``harness_*`` kind, so the line
+    #: for it is :data:`RESULT_EXPIRED_TEXT` rather than a simulation fault.
+    kind: ClassVar[str] = 'result_expired'
+
+    #: The thread completed on the server, so the scenario's close sends no ``/fail``.
+    sends_fail: ClassVar[bool] = False
+
+    def __init__(self, *, thread_id: str, job_id: str) -> None:
+        super().__init__(RESULT_EXPIRED_TEXT, thread_id=thread_id)
         self.job_id = job_id
 
 
@@ -1556,6 +1587,7 @@ __all__ = [
     'ErrorKind',
     'Finalize',
     'FinalizePollTimeout',
+    'FinalizeResultExpired',
     'FinalizeResponse',
     'HarnessFault',
     'HarnessFaultRaised',

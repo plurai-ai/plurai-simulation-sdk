@@ -59,13 +59,14 @@ import io
 import json
 import re
 import shutil
+import stat
 import sys
 import tarfile
 import tempfile
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any, TextIO
+from typing import Any, Final, TextIO
 from uuid import UUID
 
 import httpx
@@ -77,8 +78,8 @@ from plurai._platform import is_windows, utf8_stdio
 from plurai.egress import PLUGIN_WORKDIR
 from plurai.gates.cli import INGEST_OVERRULE_SUBCOMMANDS, OverruleFileError, add_overrule_argument, load_overrules, takes_overrule
 from plurai.gates.invocation import RecordTarget, current, held_exit, run_invocation
-from plurai.host_effects import host_read_scope, redacted_process_output
-from plurai.identity import sdk_identity, sdk_identity_line
+from plurai.host_effects import host_read_scope, redacted_process_output, shippable_contract_roots, shippable_error_record, shippable_text
+from plurai.identity import recorded_sdk_identity, sdk_identity, sdk_identity_line, without_machine_keys
 from plurai.ingest import backend_commands, fetch_commands, job_commands
 from plurai.ingest.anonymize import (
     KEY_DIR_NAME,
@@ -91,8 +92,11 @@ from plurai.ingest.anonymize import (
 from plurai.ingest.archive_cap import (
     ArchiveCapConfigError,
     ArchiveOverCapError,
+    check_each_member_fits,
     check_uncompressed_total,
+    pack_whole_members,
     resolve_max_uncompressed_bytes,
+    tar_member_weight,
 )
 from plurai.ingest.disclosure import (
     IngestAuditError,
@@ -128,6 +132,7 @@ from plurai.ingest.parts import (
     render_parts_disclosure,
     require_expected_sha256,
     require_expected_sha256_by_name,
+    require_expected_sha256_in_order,
     sha256_argument,
     sha256_of,
     upload_disclosed,
@@ -147,6 +152,8 @@ from plurai.ingest.storage_client import (
     StorageUploadError,
 )
 from plurai.orchestrator._retry import NetworkRefused
+from plurai.orchestrator.local_paths import LOCAL_PATH_MARKER
+from plurai.orchestrator.state_wire import scrub_run_info_paths
 from plurai import readers, scoring, verdicts
 from plurai.rag_extract import CorpusExtractionDependencyError, CorpusRootsError, CorpusScopeError
 from plurai.run_artifacts import (
@@ -1253,7 +1260,7 @@ def _sha256_and_size(path: Path, *, chunk_bytes: int = _HASH_CHUNK_BYTES) -> tup
     return hasher.hexdigest(), size
 
 
-def _build_archive(units: list[Unit], dest: Path) -> tuple[str, int]:
+def _build_archive(units: list[Unit], dest: Path, *, pax_headers: dict[str, str] | None = None) -> tuple[str, int]:
     """Stream every scrubbed unit into ONE ``.tar.gz`` at ``dest`` (tar member name == ``unit.key``),
     returning the ARCHIVE's SHA-256 + size.
 
@@ -1266,6 +1273,10 @@ def _build_archive(units: list[Unit], dest: Path) -> tuple[str, int]:
     the finished archive is hashed in bounded chunks, so neither a single large unit nor the whole
     set is ever held in memory. The tar member name is the unit's manifest ``key`` verbatim (the
     server untars members by that exact name).
+
+    ``pax_headers``, when given, is written as the archive's PAX global header, ahead of every member: the
+    archive's bytes then depend on it, and a tar reader consumes it without listing it as a member. Without
+    it the archive carries no global header.
     """
     # Duplicate keys would collide as tar members (last-win on untar → silent data loss; the backend also
     # rejects dupes at extraction). Reject them here rather than egress a lossy archive.
@@ -1276,7 +1287,7 @@ def _build_archive(units: list[Unit], dest: Path) -> tuple[str, int]:
     with (
         dest.open('wb') as raw,
         gzip.GzipFile(filename='', mode='wb', fileobj=raw, mtime=0, compresslevel=9) as gz,
-        tarfile.open(fileobj=gz, mode='w', format=tarfile.PAX_FORMAT) as tar,
+        tarfile.open(fileobj=gz, mode='w', format=tarfile.PAX_FORMAT, pax_headers=pax_headers) as tar,
     ):
         for unit in sorted(units, key=lambda u: u.key):
             info = tarfile.TarInfo(name=unit.key)  # member name == manifest key (the server untars by it)
@@ -1442,6 +1453,8 @@ async def run_ingest(
         rename_units=rename_units,
         max_uncompressed_bytes=max_uncompressed_bytes,
         over_cap_remedy=over_cap_remedy,
+        multi_part=False,
+        part_map=None,
     )
     with _prepared_units(units, plan, err=stream) as prepared:
         scrubber = prepared.scrubber
@@ -1502,6 +1515,11 @@ class _UnitPlan:
     rename_units: Callable[[Anonymizer, list[Unit]], list[Unit]] | None
     max_uncompressed_bytes: int | None
     over_cap_remedy: str | None
+    # The units may go out as several archives (`ingest-traces --multi-part`): each file is then held to one
+    # archive's room instead of the whole set to the cap, beside the scrub map `part_map` writes into every
+    # anonymized archive.
+    multi_part: bool
+    part_map: ScrubRecorder | None
 
 
 @dataclass(frozen=True)
@@ -1512,6 +1530,8 @@ class _Prepared:
     scrubber: Anonymizer | None
     member_sources: dict[str, str] | None
     total_bytes: int
+    # The server's total-uncompressed cap these units were checked against.
+    cap: int
 
 
 @contextlib.contextmanager
@@ -1522,8 +1542,9 @@ def _prepared_units(units: list[Unit], plan: _UnitPlan, *, err: TextIO) -> Itera
     a missing presidio/spaCy dep raises before any egress) and every unit is scrubbed IN PLACE, for a
     scenario bundle in a staged copy that is removed when the context exits. Under ``raw`` no scrubber is
     built, so Presidio is never imported and no ``anon.key`` is minted. The members' total size is then
-    checked against the server's total-uncompressed cap, and ``rename_units`` (anonymized only) renames
-    units whose file names carry ids the content scrub never sees.
+    checked against the server's total-uncompressed cap (under ``multi_part``, each member alone against one
+    archive's room), and ``rename_units`` (anonymized only) renames units whose file names carry ids the
+    content scrub never sees.
     """
     kind, workspace_root, posture = plan.kind, plan.workspace_root, plan.posture
     if not units:
@@ -1556,17 +1577,23 @@ def _prepared_units(units: list[Unit], plan: _UnitPlan, *, err: TextIO) -> Itera
                     scrub(scrubber, unit)  # scrub before the bytes can leave (raises → nothing archived/uploaded)
 
         # Sized after the scrub, which rewrites the files: these are the tar member sizes the server sums.
-        total_bytes = check_uncompressed_total(
-            [(unit.key, unit.path.stat().st_size) for unit in units],
-            resolve_max_uncompressed_bytes(plan.max_uncompressed_bytes),
-            remedy=plan.over_cap_remedy or _DEFAULT_OVER_CAP_REMEDY,
-        )
+        cap = resolve_max_uncompressed_bytes(plan.max_uncompressed_bytes)
+        sizes = [(unit.key, unit.path.stat().st_size) for unit in units]
+        remedy = plan.over_cap_remedy or _DEFAULT_OVER_CAP_REMEDY
+        if plan.multi_part:
+            # A file is never split, so each must fit one archive beside the scrub map (complete once the scrub
+            # has run). Weighed on the operator's own names: a pseudonym never weighs more than the name it replaces.
+            recorder = plan.part_map if plan.part_map is not None else ScrubRecorder()
+            reserve = tar_member_weight(SCRUB_MAP_MEMBER, len(recorder.member_bytes())) if scrubber is not None else 0
+            total_bytes = check_each_member_fits(sizes, cap, reserve=reserve, remedy=remedy)
+        else:
+            total_bytes = check_uncompressed_total(sizes, cap, remedy=remedy)
         # Renamed after the cap check, so an over-cap refusal names the operator's own files.
         if scrubber is not None and plan.rename_units is not None:
             renamed = plan.rename_units(scrubber, units)
             member_sources = {new.key: old.key for new, old in zip(renamed, units, strict=True)}
             units = renamed
-        yield _Prepared(units=units, scrubber=scrubber, member_sources=member_sources, total_bytes=total_bytes)
+        yield _Prepared(units=units, scrubber=scrubber, member_sources=member_sources, total_bytes=total_bytes, cap=cap)
 
 
 def _upload_preview(
@@ -1642,6 +1669,8 @@ async def run_part_ingest(
         rename_units=rename_units,
         max_uncompressed_bytes=max_uncompressed_bytes,
         over_cap_remedy=over_cap_remedy,
+        multi_part=False,
+        part_map=None,
     )
     with _prepared_units(units, plan, err=stream) as prepared:
         scrubber = prepared.scrubber
@@ -1684,6 +1713,132 @@ async def run_part_ingest(
         return entry
 
 
+#: PAX global-header keys binding every archive of a multi-part export to the whole export (see :func:`_export_binding`).
+EXPORT_BINDING_HEADER = 'plurai.export'
+EXPORT_PART_HEADER = 'plurai.part'
+
+
+def _export_binding(units: Sequence[Unit]) -> str:
+    """``sha256:<hex>`` over the sorted ``(member name, content sha256)`` pairs of a whole export (the scrub map aside).
+
+    Written into every archive of a multi-part export, so each archive's bytes depend on every file of the export:
+    a re-export that adds or changes any file, even one that keeps its size, gives all new parts, and the same
+    export gives the same parts.
+    """
+    pairs = sorted((unit.key, _sha256_and_size(unit.path)[0]) for unit in units)
+    return f'sha256:{hashlib.sha256(json.dumps(pairs, separators=(",", ":")).encode("utf-8")).hexdigest()}'
+
+
+async def run_multi_part_ingest(
+    *,
+    units: list[Unit],
+    kind: str,
+    part_kind: PartKind,
+    workspace_root: str | Path,
+    storage_client: StorageClient | None,
+    target: str | None,
+    posture: AnonymizationPosture,
+    label: str | None = None,
+    posture_source: Path | None = None,
+    scrub: PartScrub | None = None,
+    rename_units: Callable[[Anonymizer, list[Unit]], list[Unit]] | None = None,
+    max_uncompressed_bytes: int | None = None,
+    over_cap_remedy: str | None = None,
+    expect_sha256: Sequence[str] | None = None,
+    source: str | None = None,
+    err: TextIO | None = None,
+) -> list[PartEntry]:
+    """Build ``units`` as one or more content-addressed parts of whole files, disclose them together, upload the ones
+    the backend lacks, and return their entries in part order, all for ONE ``ground_workspace_start``.
+
+    The units meet the posture as in :func:`run_part_ingest`, then are packed by
+    :func:`~plurai.ingest.archive_cap.pack_whole_members`: whole files in member-name order, each part's whole
+    decompressed tar stream (and its compressed size) within the server's cap. An export that fits one part gives
+    exactly the part :func:`run_part_ingest` gives. Several parts each carry a PAX global header naming the export
+    (:func:`_export_binding`) and the part's place in it (``i/N``). Under ``anonymized`` every part carries the
+    whole run's ``scrub_map.json``, its room reserved in every part.
+
+    Refused before anything is disclosed or sent: a file that cannot fit a part of its own (named by the operator's
+    own file name), an export that needs more parts than one delivery takes, and parts that are not, in order, the
+    ``expect_sha256`` an approved plan named (:class:`~plurai.ingest.parts.PartMismatchError`). Without a
+    ``storage_client`` (and ``target``) the parts are only planned: their entries are returned and one ``planned``
+    audit entry each is written, and no request is possible. The disclosure counts the files sent, not the maps.
+    """
+    if (storage_client is None) != (target is None):
+        raise ValueError('parts are either planned (no storage client, no target) or delivered (both)')
+    stream: TextIO = err if err is not None else sys.stderr
+    recorder = scrub.recorder if scrub is not None else ScrubRecorder()
+    plan = _UnitPlan(
+        kind=kind,
+        workspace_root=workspace_root,
+        posture=posture,
+        scrub_unit=scrub.unit if scrub is not None else None,
+        rename_units=rename_units,
+        max_uncompressed_bytes=max_uncompressed_bytes,
+        over_cap_remedy=over_cap_remedy,
+        multi_part=True,
+        part_map=recorder,
+    )
+    with _prepared_units(units, plan, err=stream) as prepared:
+        scrubber = prepared.scrubber
+        remedy = over_cap_remedy or _DEFAULT_OVER_CAP_REMEDY
+        by_key = {unit.key: unit for unit in prepared.units}
+        with tempfile.TemporaryDirectory(prefix='plurai-part-') as tmpdir:
+            map_unit: Unit | None = None
+            reserve = 0
+            if scrubber is not None:
+                map_bytes = recorder.member_bytes()
+                map_unit = Unit(key=SCRUB_MAP_MEMBER, path=Path(tmpdir) / SCRUB_MAP_MEMBER)
+                map_unit.path.write_bytes(map_bytes)
+                reserve = tar_member_weight(SCRUB_MAP_MEMBER, len(map_bytes))
+            bins = pack_whole_members([(key, unit.path.stat().st_size) for key, unit in by_key.items()], prepared.cap, reserve=reserve, remedy=remedy)
+            binding = _export_binding(prepared.units) if len(bins) > 1 else None
+            parts: list[BuiltPart] = []
+            for index, keys in enumerate(bins):
+                members = [by_key[key] for key in keys] + ([map_unit] if map_unit is not None else [])
+                # One part carries no header, so an export that fits is byte-identical to a single-part ingest.
+                headers = None if binding is None else {EXPORT_BINDING_HEADER: binding, EXPORT_PART_HEADER: f'{index + 1}/{len(bins)}'}
+                archive_path = Path(tmpdir) / f'part-{index:04d}.tar.gz'
+                archive_hex, archive_bytes = _build_archive(members, archive_path, pax_headers=headers)
+                if archive_bytes > prepared.cap:
+                    raise ArchiveOverCapError(
+                        f"part {index + 1} of {len(bins)} compresses to {archive_bytes:,} bytes, over the server's {prepared.cap:,}-byte cap. "
+                        f'Nothing was uploaded.\n{remedy}'
+                    )
+                own = set(keys)
+                parts.append(
+                    BuiltPart(
+                        entry=PartEntry(
+                            kind=part_kind,
+                            label=label,
+                            sha256=f'sha256:{archive_hex}',
+                            bytes=archive_bytes,
+                            posture=posture,
+                            anon_key_fingerprint=scrubber.key_fingerprint if scrubber is not None else None,
+                        ),
+                        path=archive_path,
+                        object_name=_safe_object_name(f'{part_kind}-part', index),
+                        content_type='application/gzip',
+                        members=tuple(unit.key for unit in members),
+                        verbatim=tuple(unit.key for unit in members if unit.verbatim),
+                        member_sources={new: old for new, old in prepared.member_sources.items() if new in own}
+                        if prepared.member_sources is not None
+                        else None,
+                        scrub_summary=scrubber.scrub_summary if scrubber is not None else None,
+                    )
+                )
+            entries = [part.entry for part in parts]
+            if expect_sha256 is not None:
+                require_expected_sha256_in_order(entries, expect_sha256)
+            if storage_client is None or target is None:
+                plan_parts(parts, workspace_root=workspace_root, kind=kind)
+                return entries
+            preview = _upload_preview(prepared, plan, unit_count=len(prepared.units), target=target, posture_source=posture_source, source=source)
+            disclosure = disclose_parts(parts, workspace_root=workspace_root, kind=kind, text='\n'.join([preview.render(), *part_lines(parts)]), err=stream)
+            await upload_disclosed(storage_client, disclosure)
+        return entries
+
+
 #: The largest agent description sent; the backend refuses a larger one, so it is refused before it is sent.
 MAX_DESCRIPTION_BYTES = 8 * 1024 * 1024
 
@@ -1700,9 +1855,11 @@ async def run_descriptions_ingest(
     """Deliver agent descriptions as ``agent_description`` parts named by file, and return their entries.
 
     A description is sent as written: it is the customer's own agent description, carries no posture and is
-    not scrubbed. Each file is copied once into a staging directory and everything after that, the hash, the
-    disclosure and the upload, reads the copy, so the bytes disclosed are the bytes sent. A file that is not
-    UTF-8 text, or is larger than :data:`MAX_DESCRIPTION_BYTES`, is refused before anything is disclosed.
+    not scrubbed. The scan contract is the exception, because the SDK wrote it: its citation roots and render surface
+    are staged as :func:`~plurai.host_effects.shippable_contract_roots` writes them and every other byte is the file's
+    own; a contract that is not JSON is refused. Each file is copied once into a staging directory and everything after
+    that, the hash, the disclosure and the upload, reads the copy, so the bytes disclosed are the bytes sent. A file
+    that is not UTF-8 text, or is larger than :data:`MAX_DESCRIPTION_BYTES`, is refused before anything is disclosed.
 
     ``expect_sha256`` maps part names to the hashes an approved plan named; the parts built must be exactly those,
     or :class:`~plurai.ingest.parts.PartMismatchError` is raised before anything is disclosed or sent. Without a
@@ -1729,6 +1886,12 @@ async def run_descriptions_ingest(
                 raw.decode('utf-8')
             except UnicodeDecodeError:
                 raise IngestInputError(f'{source} is not UTF-8 text; an agent description is a text file') from None
+            if name == SCAN_CONTRACT_NAME:
+                try:
+                    raw = shippable_contract_roots(raw.decode('utf-8')).encode('utf-8')
+                except ValueError as exc:
+                    # The SDK wrote this file, and a copy whose local paths cannot be rewritten is never sent as it is.
+                    raise IngestInputError(f'{source} ({SCAN_CONTRACT_NAME}) is not a scan contract the SDK can read ({exc}); nothing was sent') from None
             staged = Path(tmpdir) / f'{len(parts):02d}'
             staged.write_bytes(raw)
             sha256, size = sha256_of(staged)
@@ -1780,6 +1943,8 @@ class PartSpec:
     scrub: PartScrub | None = None
     # Where the units came from when that is a local folder; the disclosure names it.
     source: str | None = None
+    # Send the units as several parts of whole files when they are over one archive's cap, and print a list.
+    multi_part: bool = False
 
 
 def _trace_part_scrub(declared: frozenset[str]) -> PartScrub:
@@ -1859,11 +2024,16 @@ def _dispatch(
     # Resolved here, not left to run_ingest, so a malformed cap override is refused before the
     # storage client or the scrubber is built.
     max_uncompressed_bytes = resolve_max_uncompressed_bytes()
+    # `ingest-traces` collects --expect-sha256 as a list (more than one only under --multi-part); `ingest-corpus` takes one.
+    expected = getattr(args, 'expect_sha256', None)
+    expected_one = expected[0] if isinstance(expected, list) and expected else expected or None
 
     # The storage client is built from the configured backend (URL + bearer); the disclosure
     # target is read OFF THE CLIENT (client.base_url) — the consent surface shows the
     # exact base the upload hits, so disclosure and egress cannot drift.
-    async def _go() -> IngestManifest | PartEntry:
+    async def _go() -> IngestManifest | PartEntry | list[PartEntry]:
+        if part is not None and part.multi_part:
+            return await _go_multi_part(part)
         if part is not None and plan_only:
             # No client is built, so a plan needs no backend credentials and has no way to reach the network.
             return await run_part_ingest(
@@ -1880,7 +2050,7 @@ def _dispatch(
                 rename_units=rename_units,
                 max_uncompressed_bytes=max_uncompressed_bytes,
                 over_cap_remedy=over_cap_remedy,
-                expect_sha256=getattr(args, 'expect_sha256', None),
+                expect_sha256=expected_one,
             )
         async with StorageClient.from_env() as client:
             if part is not None:
@@ -1898,7 +2068,7 @@ def _dispatch(
                     rename_units=rename_units,
                     max_uncompressed_bytes=max_uncompressed_bytes,
                     over_cap_remedy=over_cap_remedy,
-                    expect_sha256=getattr(args, 'expect_sha256', None),
+                    expect_sha256=expected_one,
                     source=part.source,
                 )
             return await run_ingest(
@@ -1916,9 +2086,35 @@ def _dispatch(
                 over_cap_remedy=over_cap_remedy,
             )
 
+    async def _go_multi_part(part: PartSpec) -> list[PartEntry]:
+        common: dict[str, Any] = {
+            'units': units,
+            'kind': kind,
+            'part_kind': part.kind,
+            'label': part.label,
+            'workspace_root': args.workspace_root,
+            'posture': resolution.posture,
+            'posture_source': resolution.source,
+            'scrub': part.scrub,
+            'rename_units': rename_units,
+            'max_uncompressed_bytes': max_uncompressed_bytes,
+            'over_cap_remedy': over_cap_remedy,
+            'expect_sha256': expected,
+        }
+        if plan_only:
+            # As for one part: no client is built, so a plan reads no credentials and cannot reach the network.
+            return await run_multi_part_ingest(**common, storage_client=None, target=None)
+        async with StorageClient.from_env() as client:
+            return await run_multi_part_ingest(**common, storage_client=client, target=client.base_url, source=part.source)
+
     manifest = asyncio.run(_go())
-    # stdout = the part entry (a grounding part) or the single-archive manifest (a lease), for the plugin
-    shown = planned_entry(manifest) if plan_only and isinstance(manifest, PartEntry) else manifest.model_dump(mode='json')
+    # stdout = the part entry (a grounding part), the part entries in order (--multi-part), or the single-archive
+    # manifest (a lease), for the plugin
+    shown: Any
+    if isinstance(manifest, list):
+        shown = [planned_entry(entry) if plan_only else entry.model_dump(mode='json') for entry in manifest]
+    else:
+        shown = planned_entry(manifest) if plan_only and isinstance(manifest, PartEntry) else manifest.model_dump(mode='json')
     print(json.dumps(shown, ensure_ascii=False))
     if plan_only:
         print(f'plurai {getattr(args, "command", None) or f"ingest-{kind}"}: plan only; nothing was sent.', file=sys.stderr)
@@ -2134,6 +2330,13 @@ def _expected_by_name(pairs: list[tuple[str, str]] | None) -> dict[str, str] | N
 def _cmd_traces(args: argparse.Namespace) -> int:
     from plurai.trace_extract import extract_traces
 
+    expected = args.expect_sha256 or []
+    if len(expected) > 1 and not args.multi_part:  # refused before the sink is exported
+        print(
+            f'plurai ingest-traces: error: --expect-sha256 was given {len(expected)} times; one export is one part unless --multi-part is set.',
+            file=sys.stderr,
+        )
+        return exit_codes.USAGE
     declared = load_declared_names(args.declared_names) if args.declared_names else frozenset()  # refused before the sink is exported
     source_config = json.loads(Path(args.source_config).read_text(encoding='utf-8')) if args.source_config else {}
     manifest = extract_traces(args.source_kind, source_config, args.out_dir, limit=args.limit)
@@ -2144,7 +2347,7 @@ def _cmd_traces(args: argparse.Namespace) -> int:
         declaration_required=True,
         rename_units=pseudonymize_trace_units,
         over_cap_remedy=_trace_over_cap_remedy(args.source_kind),
-        part=PartSpec('trace_archive', scrub=_trace_part_scrub(declared), source=_trace_source_line(args.source_kind, manifest)),
+        part=PartSpec('trace_archive', scrub=_trace_part_scrub(declared), source=_trace_source_line(args.source_kind, manifest), multi_part=args.multi_part),
     )
 
 
@@ -2156,10 +2359,20 @@ def _trace_source_line(source_kind: str, manifest: dict[str, Any]) -> str | None
 
 
 def _trace_over_cap_remedy(source_kind: str) -> str:
-    """How this trace source exports fewer traces, for the over-cap refusal."""
+    """How this trace source exports fewer traces, for the over-cap refusal.
+
+    A source that groups by conversation also names ``"group": "trace"``: one conversation too large
+    to send whole is otherwise a dead end, since ``--limit`` never cuts a conversation short.
+    """
     keys = trace_selection_keys().get(source_kind, [])
-    narrowing = f'select fewer traces with {" or ".join(f"`{key}`" for key in keys)} in --source-config (leave out the largest above), or ' if keys else ''
-    return f'Narrow the export and re-run: {narrowing}lower --limit.'
+    narrowing_keys = [key for key in keys if key != 'group']
+    narrowing = (
+        f'select fewer traces with {" or ".join(f"`{key}`" for key in narrowing_keys)} in --source-config (leave out the largest above), or '
+        if narrowing_keys
+        else ''
+    )
+    by_trace = ' A conversation too large to send whole can be sent in part: set `"group": "trace"` in --source-config, and --limit then counts traces.'
+    return f'Narrow the export and re-run: {narrowing}lower --limit.{by_trace if "group" in keys else ""}'
 
 
 def _cmd_doc_examples(args: argparse.Namespace) -> int:
@@ -2248,9 +2461,17 @@ def _cmd_bundle(args: argparse.Namespace) -> int:
     # No SDK extractor: the bundle is a pre-materialized directory of record files.
     units = bundle_units(args.bundle_dir)
     declaration_required = not recorded_regressions_only(args.bundle_dir, units)
+    # Records are staged as copies so the rewrites never touch the bundle on disk. The set-level overview is copied
+    # beside them because the anonymized staging reads it from the root the units share.
     with tempfile.TemporaryDirectory(prefix='plurai-bundle-text-') as stage:
-        twins = bundle_text_twins(units, Path(stage), err=sys.stderr)
-        return _dispatch(args, units=[*units, *twins], kind='scenario-bundle', declaration_required=declaration_required)
+        overview = Path(args.bundle_dir) / BUNDLE_SET_OVERVIEW
+        staged = _staged_copies(units, Path(stage) / 'records')
+        if overview.is_file():
+            (Path(stage) / 'records').mkdir(parents=True, exist_ok=True)
+            shutil.copy2(overview, Path(stage) / 'records' / BUNDLE_SET_OVERVIEW)
+        _keep_local_paths_home(staged, command='ingest-bundle')
+        twins = bundle_text_twins(staged, Path(stage) / 'twins', err=sys.stderr)
+        return _dispatch(args, units=[*staged, *twins], kind='scenario-bundle', declaration_required=declaration_required)
 
 
 def recorded_agent_versions(run_dir: str | Path | None) -> dict[str, str]:
@@ -2354,7 +2575,7 @@ def _run_provenance(args: argparse.Namespace) -> RunProvenance:
         sdk_version=__version__,
         # The identity that does not depend on dist metadata being fresh. Kept BESIDE
         # ``sdk_version`` rather than replacing it: backend readers key off the version string.
-        sdk_identity=sdk_identity(),
+        sdk_identity=recorded_sdk_identity(),
         eval_set_id=args.eval_set_id,
         scenario_set_id=args.scenario_set_id,
         harness_fingerprint=args.harness_fingerprint,
@@ -2407,29 +2628,195 @@ def _warn_home_named(units: Sequence[Unit], workspace_root: str | Path, *, comma
         )
 
 
-def _scrub_home_paths(staged: Sequence[Unit]) -> None:
-    """Our own run material (the staged copies, never the run on disk) with the operator's home folder written ``~``:
-    only that prefix is replaced (``/Users/<name>/out/Q3.xlsx`` ships as ``~/out/Q3.xlsx``), every later segment and
-    file name kept, so a backend re-judge reads the same names the local verdicts read. In every posture: the
-    operator's home is no part of the material under test. ``run_summary.json`` too — its paths are no join key. A
-    file that is not UTF-8 text is left as it is, and so is one that will not write back (said on stderr)."""
-    home = str(Path.home()).rstrip('/\\')
-    if len(home) < 2:
-        return
-    spellings = sorted({home, json.dumps(home)[1:-1]}, key=len, reverse=True)
-    prefix = re.compile('|'.join(rf'(?<![\w/\\]){re.escape(h)}(?![\w.-])' for h in spellings))
+def _staged_copies(units: Sequence[Unit], staging: Path) -> list[Unit]:
+    """``units`` copied under ``staging`` at their keys: the copies every rewrite is applied to, so the operator's files are only read."""
+    staged: list[Unit] = []
+    for unit in units:
+        dest = staging / unit.key
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(unit.path, dest)
+        # ``copy2`` keeps the mode; a read-only run (a checkout, a restored archive) must still be rewritable here.
+        dest.chmod(dest.stat().st_mode | stat.S_IWUSR)
+        staged.append(Unit(key=unit.key, path=dest))
+    return staged
+
+
+def _rewrite_staged(staged: Sequence[Unit], rewrite: Callable[[Unit, str], str], *, what: str) -> int:
+    """Replace each staged copy's text with what ``rewrite(unit, text)`` returns, when that differs; the number of files rewritten.
+
+    A file that is not UTF-8 text is left as it is. One that will not write back raises :class:`IngestInputError`, naming
+    ``what``: a copy is never sent with what the rewrite was meant to replace.
+    """
+    rewritten = 0
     for unit in staged:
         try:
             text = unit.path.read_text(encoding='utf-8')
         except (OSError, UnicodeDecodeError):
             continue
-        scrubbed, n = prefix.subn('~', text)
-        if not n:
+        new = rewrite(unit, text)
+        if new == text:
             continue
         try:
-            unit.path.write_text(scrubbed, encoding='utf-8')
+            unit.path.write_text(new, encoding='utf-8')
         except (OSError, UnicodeEncodeError) as exc:
-            print(f'plurai: {unit.key} uploads with its home paths unscrubbed ({type(exc).__name__})', file=sys.stderr)
+            raise IngestInputError(f'{unit.key}: the upload copy could not be written without its {what} ({type(exc).__name__}); nothing was sent') from None
+        rewritten += 1
+    return rewritten
+
+
+def _scrub_home_paths(staged: Sequence[Unit]) -> None:
+    """Our own run material (the staged copies, never the run on disk) with the operator's home folder written ``~``:
+    only that prefix is replaced (``/Users/<name>/out/Q3.xlsx`` ships as ``~/out/Q3.xlsx``), every later segment and
+    file name kept, so a backend re-judge reads the same names the local verdicts read. In every posture: the
+    operator's home is no part of the material under test. ``run_summary.json`` too — its paths are no join key."""
+    home = str(Path.home()).rstrip('/\\')
+    if len(home) < 2:
+        return
+    spellings = sorted({home, json.dumps(home)[1:-1]}, key=len, reverse=True)
+    prefix = re.compile('|'.join(rf'(?<![\w/\\]){re.escape(h)}(?![\w.-])' for h in spellings))
+    _rewrite_staged(staged, lambda _unit, text: prefix.sub('~', text), what='home paths')
+
+
+def _without_identity_path(holder: dict[str, Any]) -> dict[str, Any]:
+    """``holder`` with the install path dropped from its ``sdk_identity`` (a run recorded by an SDK that stored it)."""
+    identity = holder.get('sdk_identity')
+    return {**holder, 'sdk_identity': without_machine_keys(identity)} if isinstance(identity, dict) else holder
+
+
+def _recorded_texts(holder: dict[str, Any]) -> dict[str, Any]:
+    """``holder``, a record the SDK wrote about a run, as a text it writes may leave the machine.
+
+    A recorded run does not carry its project root, so no path is written relative to it: every local path is the
+    marker. A text the runner already wrote with this rule holds no absolute path and comes back unchanged.
+    """
+    return shippable_text(_without_identity_path(holder), project=None)
+
+
+def _state_without_local_paths(holder: Any) -> Any:
+    """``holder`` with the Run info rule applied to its ``agent_state`` when that is a mapping."""
+    state = holder.get('agent_state') if isinstance(holder, dict) else None
+    if not isinstance(state, dict):
+        return holder
+    scrubbed, _ = scrub_run_info_paths(state)
+    return {**holder, 'agent_state': scrubbed}
+
+
+def _with_shipped_key(holder: Any, key: str) -> Any:
+    """``holder`` with the text at ``key`` written as a text the SDK writes may leave the machine, when it is a mapping that has one."""
+    return {**holder, key: _recorded_texts({key: holder[key]})[key]} if isinstance(holder, dict) and key in holder else holder
+
+
+def _turn_without_local_paths(turn: Any) -> Any:
+    """A recorded turn: the Run info rule on its agent state, and the strict rule on the texts the SDK wrote about the
+    user's act and the planted channel inputs (``detail``). Every other value of the turn is the agent's or the user's."""
+    turn = _state_without_local_paths(turn)
+    if not isinstance(turn, dict):
+        return turn
+    turn = {**turn, 'user_action_result': _with_shipped_key(turn['user_action_result'], 'detail')} if 'user_action_result' in turn else turn
+    if isinstance(inputs := turn.get('channel_inputs'), list):
+        turn = {**turn, 'channel_inputs': [_with_shipped_key(entry, 'detail') for entry in inputs]}
+    return turn
+
+
+def _pipeline_io_without_local_paths(doc: dict[str, Any]) -> dict[str, Any]:
+    """A pipeline hop's record: its ``error`` is the SDK's text about the hop; ``inputs`` and ``outputs`` are the component's."""
+    return _with_shipped_key(doc, 'error')
+
+
+def _transcript_without_local_paths(doc: dict[str, Any]) -> dict[str, Any]:
+    out = dict(doc)
+    # The closing turn's state is a turn of its own, so one walk over ``turns`` covers every recorded state.
+    if isinstance(turns := doc.get('turns'), list):
+        out['turns'] = [_turn_without_local_paths(turn) for turn in turns]
+    # The resume seed is an agent state the backend handed back, so it carries the same ``run_info``.
+    if 'resume_seed' in doc:
+        out['resume_seed'] = _state_without_local_paths(doc['resume_seed'])
+    # ``metadata`` is the SDK's own record of the run (identity, failure texts), never the agent's work.
+    if isinstance(metadata := doc.get('metadata'), dict):
+        out['metadata'] = _recorded_texts(metadata)
+    if isinstance(pipeline_io := doc.get('pipeline_io'), dict):
+        out['pipeline_io'] = _pipeline_io_without_local_paths(pipeline_io)
+    return out
+
+
+#: The staged JSON files that can hold a local path from a run recorded by an older SDK, by file name, and the
+#: rewrite each gets: the document as an upload copy holds it.
+_LOCAL_PATH_REWRITES: Final[Mapping[str, Callable[[dict[str, Any]], dict[str, Any]]]] = {
+    RESUME_PIN_FILENAME: _state_without_local_paths,
+    'transcript.json': _transcript_without_local_paths,
+    RUN_SUMMARY_FILENAME: _recorded_texts,
+    'error.json': shippable_error_record,
+    'pipeline_io.json': _pipeline_io_without_local_paths,
+}
+
+
+def _dumped_like(text: str, doc: dict[str, Any]) -> str:
+    """``doc`` as JSON in the layout ``text`` was written in: its indent, its ASCII escaping and its trailing newline."""
+    indent = re.search(r'\n( +)\S', text)
+    out = json.dumps(doc, indent=len(indent.group(1)) if indent else None, ensure_ascii=text.isascii())
+    return f'{out}\n' if text.endswith('\n') else out
+
+
+def _values_replaced(before: Any, after: Any) -> int:
+    """How many values of the JSON document ``before`` differ in ``after``, the same document with some values replaced.
+
+    It is the equality check of a rewrite that also counts: a changed leaf counts once, and so does a dropped or renamed
+    key and a list item added or removed.
+    """
+    if isinstance(before, dict) and isinstance(after, dict):
+        removed = before.keys() - after.keys()
+        added = after.keys() - before.keys()
+        return max(len(removed), len(added)) + sum(_values_replaced(before[key], after[key]) for key in before.keys() & after.keys())
+    if isinstance(before, list) and isinstance(after, list):
+        return abs(len(before) - len(after)) + sum(_values_replaced(old, new) for old, new in zip(before, after, strict=False))
+    return 0 if type(before) is type(after) and before == after else 1
+
+
+def _keep_local_paths_home(staged: Sequence[Unit], *, command: str) -> int:
+    """Rewrite staged copies of material recorded by an older SDK so they hold no local path.
+
+    Three rules apply: the SDK identity loses its install path; every recorded agent state gets the Run info rule (the
+    top-level ``run_info`` key only; the size cap and the document reference belong to the live projection and are not
+    applied twice); and the texts the SDK wrote (the error record, the transcript's metadata, a pipeline hop's error, a
+    user act's and a channel input's ``detail``, the run summary) get :func:`~plurai.host_effects.shippable_text` with
+    no project. The agent's own work in those files is not read. Only staged copies change, never the run or bundle on
+    disk, in every posture. A file is written back only when it changed, in its writer's JSON layout, a byte order mark
+    included. The rule fails closed: a file it cannot read as a JSON object, or cannot write back, raises
+    :class:`IngestInputError` before anything is sent. One stderr line gives the number of values replaced, which is
+    also what it returns.
+    """
+    replaced = 0
+    for unit in staged:
+        if (local_paths_rule := _LOCAL_PATH_REWRITES.get(PurePosixPath(unit.key).name)) is None:
+            continue
+        try:
+            text = unit.path.read_text(encoding='utf-8')
+            bom = '\ufeff' if text.startswith('\ufeff') else ''
+            doc = json.loads(text[len(bom) :])
+        except (OSError, UnicodeDecodeError, ValueError) as exc:
+            raise IngestInputError(
+                f'{unit.key} cannot be read as the JSON the SDK writes ({type(exc).__name__}), so its local paths cannot be replaced; nothing was sent'
+            ) from None
+        if not isinstance(doc, dict):
+            raise IngestInputError(
+                f'{unit.key} holds a JSON {type(doc).__name__}, not the object the SDK writes, so its local paths cannot be replaced; nothing was sent'
+            )
+        if not (changed := _values_replaced(doc, shipped := local_paths_rule(doc))):
+            continue
+        try:
+            unit.path.write_text(bom + _dumped_like(text[len(bom) :], shipped), encoding='utf-8')
+        except OSError as exc:
+            raise IngestInputError(
+                f'{unit.key}: the upload copy could not be written without its local paths ({type(exc).__name__}); nothing was sent'
+            ) from None
+        replaced += changed
+    if replaced:
+        print(
+            f'plurai {command}: {replaced} local path value(s) in the recorded SDK identity, Run info and texts '
+            f'are not sent (replaced in the upload copies; "{LOCAL_PATH_MARKER}" stands in for a path).',
+            file=sys.stderr,
+        )
+    return replaced
 
 
 def _cmd_run(args: argparse.Namespace) -> int:
@@ -2438,13 +2825,9 @@ def _cmd_run(args: argparse.Namespace) -> int:
     # what gets its trial stamp and home-path hygiene, so the original artifacts are never rewritten.
     units = run_units(args.run_dir)
     with tempfile.TemporaryDirectory(prefix='plurai-ingest-run-') as staging:
-        staged: list[Unit] = []
-        for unit in units:
-            dest = Path(staging) / unit.key
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(unit.path, dest)
-            staged.append(Unit(key=unit.key, path=dest))
+        staged = _staged_copies(units, Path(staging))
         _stamp_trials_not_uploaded(Path(args.run_dir), units=units, staged_summary=Path(staging) / RUN_SUMMARY_FILENAME)
+        _keep_local_paths_home(staged, command='ingest-run')
         _scrub_home_paths(staged)
         return _dispatch(
             args,
@@ -2466,12 +2849,7 @@ def _cmd_run_report(args: argparse.Namespace) -> int:
         return 0
     # Copied first, like ingest-run: the home-path hygiene rewrites units in place, and these are the operator's report.
     with tempfile.TemporaryDirectory(prefix='plurai-ingest-run-report-') as staging:
-        staged: list[Unit] = []
-        for unit in units:
-            dest = Path(staging) / unit.key
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(unit.path, dest)
-            staged.append(Unit(key=unit.key, path=dest))
+        staged = _staged_copies(units, Path(staging))
         _scrub_home_paths(staged)
         return _dispatch(args, units=staged, kind='run-report', declaration_required=False)
 
@@ -2673,7 +3051,18 @@ def _add_plan_only(parser: argparse.ArgumentParser, *, expect: str) -> None:
         '"planned" entry, never an upload, and nothing is shown as an upload disclosure. Under `anonymized` posture the workspace key is minted '
         'if absent, so the real run scrubs under the same key.',
     )
-    if expect == 'one':
+    if expect == 'parts':
+        parser.add_argument(
+            '--expect-sha256',
+            type=sha256_argument,
+            action='append',
+            default=None,
+            metavar='sha256:HEX',
+            help='The hash the approved plan printed. A part that hashes differently is refused after it is built and before anything is disclosed '
+            'or sent, with one stderr line naming both hashes. Under --multi-part, repeat it once per part in the order the plan printed them: '
+            'the parts built must be exactly those, in that order. Given more than once without --multi-part, it is refused.',
+        )
+    elif expect == 'one':
         parser.add_argument(
             '--expect-sha256',
             type=sha256_argument,
@@ -2727,7 +3116,7 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
 
 
 #: Behaviour a caller can require of this build, beyond the commands it lists (see :func:`_cmd_capabilities`).
-FEATURES = ('parts-only-upload', 'content-addressed-parts', 'corpus-domain-member', 'plan-only-parts', 'export-dir-traces')
+FEATURES = ('parts-only-upload', 'content-addressed-parts', 'corpus-domain-member', 'plan-only-parts', 'export-dir-traces', 'multi-part-traces')
 
 
 def _billing_url() -> str:
@@ -2916,9 +3305,23 @@ def build_parser() -> argparse.ArgumentParser:
     traces.add_argument('--source-kind', required=True)
     traces.add_argument('--source-config', default=None, type=expand_user_path, help='Path to a JSON file of sink source config (credentials stay local).')
     traces.add_argument('--out-dir', required=True, type=expand_user_path)
-    traces.add_argument('--limit', type=int, default=None)
+    traces.add_argument(
+        '--limit',
+        type=int,
+        default=None,
+        help='How many files to export: the newest conversations (each exported whole), or the newest traces when --source-config '
+        'sets "group": "trace". With "thread_ids", the first listed conversations; from export_dir without "thread_ids", the first '
+        "files in the export's conversation order (file-name order for an export by trace). Default: everything the selection matches.",
+    )
     _add_declared_names(traces)
-    _add_plan_only(traces, expect='one')
+    traces.add_argument(
+        '--multi-part',
+        action='store_true',
+        help="When the export is over one archive's size limit, send it as several archives, each holding whole files, all disclosed "
+        'together, and print the part entries as a JSON list in part order (one entry when it fits). The same export gives the same '
+        'parts on every run.',
+    )
+    _add_plan_only(traces, expect='parts')
     traces.set_defaults(func=_cmd_traces)
 
     descriptions = sub.add_parser('ingest-descriptions', help='Deliver the agent descriptions as content-addressed parts.')

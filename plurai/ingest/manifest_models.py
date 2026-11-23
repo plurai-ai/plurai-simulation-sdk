@@ -95,7 +95,7 @@ class RunProvenance(BaseModel):
     scenario_set_id: str | None = None
     #: Opaque driver-computed digest of the harness file manifest. Never parsed here.
     harness_fingerprint: str | None = None
-    #: WHICH SDK actually ran, from the LOADED module (:func:`plurai.identity.sdk_identity`).
+    #: WHICH SDK actually ran, from the LOADED module (:func:`plurai.identity.recorded_sdk_identity`: the build, never the install path).
     #: ``sdk_version`` above is dist metadata, which can disagree with the code that actually ran
     #: (e.g. a stale editable install). This block names the commit (or the content hash) and the
     #: client contract version, so a replay can say which client SHAPE produced the transcripts it

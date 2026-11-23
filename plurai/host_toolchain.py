@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import importlib
 import importlib.util
 import json
@@ -73,6 +74,7 @@ from plurai.host_effects import (
     HostRequirement,
     confine,
     declared_host_requirements,
+    shippable_text,
 )
 from plurai.user_path import expand_user_path
 
@@ -148,6 +150,9 @@ class HostToolchain:
     #: What is missing, structured for the install block (:func:`install_plan`), and the block's head.
     install_plan: Mapping[str, Any] = field(default_factory=dict)
     install_head: str = ''
+    #: The same rows with each detail as measured, naming the interpreter, ``node`` or a file of the operator's: for
+    #: the operator's own terminal (:func:`main`'s plain print) only. :meth:`as_dict` never carries it.
+    local_requirements: tuple[RequirementStatus, ...] = ()
 
     @property
     def install_block(self) -> str:
@@ -632,9 +637,14 @@ def check_host_toolchain(workdir: str | Path, *, probe_runner: ProbeRunner | Non
     if confinement == 'agent_process':
         # an import runs where this process runs; under the agent's confined CLI Bash it proves nothing of the Bash route
         _proven_by_imports(declared, statuses)
-    rows = tuple(statuses[i] for i in range(len(declared)))
-    head = INSTALL_BLOCK_HEAD.format(agent=root.resolve().parent)
-    return HostToolchain(rows, confinement, install_plan([r.as_dict() for r in rows], declared), head)
+    # A detail can name the interpreter, ``node`` or a file of the operator's. The rows and ``--json`` (which the
+    # plugin's run-gate turns into gate reasons) carry it as it may leave the machine; only the plain print keeps it.
+    # The install head keeps the agent's folder: it is the operator's copy-paste block, and no record carries it.
+    local = tuple(statuses[i] for i in range(len(declared)))
+    agent = root.resolve().parent
+    rows = tuple(dataclasses.replace(r, detail=shippable_text(r.detail, project=agent)) for r in local)
+    head = INSTALL_BLOCK_HEAD.format(agent=agent)
+    return HostToolchain(rows, confinement, install_plan([r.as_dict() for r in local], declared), head, local)
 
 
 def unreadable_requirements(workdir: Path) -> tuple[RequirementStatus, ...]:
@@ -730,7 +740,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.json:
         print(json.dumps(toolchain.as_dict()))
     else:
-        for row in toolchain.requirements:
+        for row in toolchain.local_requirements or toolchain.requirements:
             print(f'{row.name} ({row.kind}): {row.status}' + (f' — {row.detail}' if row.detail else ''))
         if toolchain.install_block:
             print(toolchain.install_block)

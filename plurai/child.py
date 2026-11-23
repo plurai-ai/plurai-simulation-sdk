@@ -137,8 +137,10 @@ from plurai.host_effects import (
     _jsonl_dicts,
     cli_transcript_rows,
     end_cli_processes_in_loop,
+    harness_project,
     reconcile_trail,
     redact_cli_credentials,
+    shippable_text,
     trail_recorded,
 )
 from plurai.ingest.workspace_config import CONFIG_FILENAME, WorkspaceConfigError, bench_config_roots, discover_config_documents
@@ -1598,6 +1600,8 @@ class _ChildSession:
         self.world_snapshot = _resolve_world_snapshot(module)
         # The hook that applies the simulated user's act to a world the harness owns. Optional.
         self.apply_user_action = _resolve_user_action_hook(module)
+        # The project root a text about the run names its files from (``<project>/plurai_sim/simulate.py``).
+        self._project = harness_project(module.__file__) if getattr(module, '__file__', None) else None
         # What the simulated user can see, captured after every agent turn (see ``_turn_world``):
         # the declared surface row types (read once), the last capture reported as observed, the
         # post-seed delta the first observed report carries, and why every turn is unobservable
@@ -2079,7 +2083,8 @@ class _ChildSession:
         if faults := take_harness_faults():
             status, detail, unexecutable_by = 'refused', '; '.join(dict.fromkeys(f.message for f in faults)), None
         refused_by = ('hook' if self.apply_user_action is not None else 'mock') if status == 'refused' else None
-        return status, detail, refused_by, unexecutable_by
+        # The detail is an exception's or a fault's text, and it reaches the requests and the transcript.
+        return status, None if detail is None else shippable_text(detail, project=self._project), refused_by, unexecutable_by
 
     async def _write_channel_row(self, entry: PlannedChannelInput, entity_id: str, updates: dict[str, Any], **extra: Any) -> tuple[ChannelStatus, str | None]:
         """Write one planted row through :meth:`_write_as_user`. The act names the channel as its ``surface`` and the

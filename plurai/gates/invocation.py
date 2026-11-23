@@ -62,7 +62,7 @@ from plurai.gates.apply import apply_overrules
 from plurai.gates.catalogue import CELL_HOLDS, gate_spec, is_sdk_gate
 from plurai.gates.cli import OverrulesFile
 from plurai.gates.contract import HARD_AUTHORITIES, GateFinding, Overrule, OverruleOutcome, OverruleOutcomeKind
-from plurai.identity import sdk_identity
+from plurai.identity import recorded_sdk_identity
 
 #: The runner's record, beside ``run_summary.json`` in ``--out`` (never inside it).
 GATE_AUTHORITY_FILENAME: Final[str] = 'gate_authority.json'
@@ -240,7 +240,7 @@ class GateAuthority:
             'schema': GATE_AUTHORITY_SCHEMA,
             'written_at': datetime.now(UTC).isoformat(),
             'command': self.command,
-            'sdk_identity': sdk_identity(),
+            'sdk_identity': recorded_sdk_identity(),
             'exit_code': exit_code,
             'overrules_file': self.overrules_file.as_record() if self.overrules_file is not None else None,
             'findings': [f.model_dump(mode='json') for f in self.findings],

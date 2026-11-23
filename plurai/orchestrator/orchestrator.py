@@ -48,7 +48,7 @@ import httpx
 
 from plurai._endpoints import TOKEN_ENV, URL_ENV, Endpoint, NotConfiguredError
 from plurai.content_parts import SILENT_PART_KINDS, content_text, declared_part, document_part_values, opener_content, with_part_values
-from plurai.host_effects import redact_value, register_backend_token, trail_recorded
+from plurai.host_effects import harness_project, redact_value, register_backend_token, shippable_text, shipped_error, trail_recorded
 from plurai.module_bindings import _module_scope_bindings
 from plurai.run_artifacts import _NON_AGENT_TYPES, REPLAY_CUT_REASON, SEED_RESTORE_KEY, reply_source_counts
 from plurai.observability.sink_protocol import NoOpSink, ObservabilitySink, RunContext, TranscriptTurn
@@ -79,6 +79,7 @@ from plurai._protocol import (
     ProviderInfra,
     FinalizeJobFailed,
     FinalizePollTimeout,
+    FinalizeResultExpired,
     HarnessChildExited,
     HarnessFaultRaised,
     MockMode,
@@ -107,7 +108,8 @@ from plurai.orchestrator.client import (
 )
 from plurai.orchestrator.models import CreateThreadResponse, FinalizeResponse
 from plurai.orchestrator.redrive import static_trigger, wait_until_ready
-from plurai.orchestrator.state_wire import AGENT_STATE_LEAF_CAP_BYTES, map_string_leaves, wire_agent_state
+from plurai.orchestrator.local_paths import LOCAL_PATH_MARKER
+from plurai.orchestrator.state_wire import AGENT_STATE_LEAF_CAP_BYTES, map_string_leaves, wire_agent_state, wire_value
 from plurai.orchestrator.world_images import StorageClientFactory, storage_client_for, upload_world_images
 from plurai.world.readback import SEED_NOT_LANDED_REASON, seed_readback_at_init
 from plurai.settings import FULL_RUN_SCENARIO_TIME_BUDGET, Settings
@@ -469,6 +471,7 @@ def reset_warning_ledgers() -> None:
     _warned_dropped_calls.clear()
     _warned_uncanonical.clear()
     _warned_omitted_state.clear()
+    _noted_local_path_state.clear()
     # These two are worse than a stale warning: the first caches a DISPATCH ROUTE keyed on path
     # with no content invalidation, so a harness that grows ``invoke_pipeline`` between passes of
     # an in-process loop keeps being driven as a dialog; the second permanently exempts a path
@@ -723,6 +726,9 @@ _warned_uncanonical: set[tuple[str, str]] = set()
 #: RUN-scoped like the ledger above.
 _warned_omitted_state: set[tuple[str, str]] = set()
 
+#: One INFO line per (thread, ``agent_state`` key path) whose local path the wire replaced; RUN-scoped like the ledger above.
+_noted_local_path_state: set[tuple[str, str]] = set()
+
 
 def _reference_by_fold(served: Mapping[str, str]) -> dict[str, str]:
     """``served`` (reference → fold) inverted. Byte-identical documents share a fold, and the first reference served for them names it."""
@@ -732,15 +738,18 @@ def _reference_by_fold(served: Mapping[str, str]) -> dict[str, str]:
     return by_fold
 
 
-def _wire_state_of(state: dict[str, Any] | None, reference_of: Mapping[str, str], *, thread_id: str, label: str = 'agent_state') -> dict[str, Any] | None:
+def _wire_state_of(
+    state: dict[str, Any] | None, reference_of: Mapping[str, str], *, thread_id: str, label: str = 'agent_state', turn_state: bool = True
+) -> dict[str, Any] | None:
     """``state`` as BOTH of its carriers record it: the request body and the transcript row. ``label`` names it in the logs.
 
     A served document the agent echoes goes back as its ``<scheme>:///`` reference, and a string leaf
     over the wire cap as a descriptor (:mod:`plurai.orchestrator.state_wire`). One value for both
-    carriers, so a re-score of the transcript reads what the live judges read. Applies to a turn's
-    ``agent_state`` and to a pipeline hop's outputs alike.
+    carriers, so a re-score of the transcript reads what the live judges read. A turn's ``agent_state``
+    also has a local path under ``run_info`` replaced by its marker; a pipeline hop's outputs pass
+    ``turn_state=False`` and are the component's own output, so they keep any local path.
     """
-    wire = wire_agent_state(state, served=reference_of)
+    wire = (wire_agent_state if turn_state else wire_value)(state, served=reference_of)
     logger = logging.getLogger(__name__)
     if wire.referenced:
         logger.debug('Thread %s: %s %s sent as the served document reference.', thread_id, label, ', '.join(wire.referenced))
@@ -755,6 +764,10 @@ def _wire_state_of(state: dict[str, Any] | None, reference_of: Mapping[str, str]
                 path,
                 f'{AGENT_STATE_LEAF_CAP_BYTES:,}',
             )
+    for path in wire.local_paths:
+        if (thread_id, f'{label}.{path}') not in _noted_local_path_state:
+            _noted_local_path_state.add((thread_id, f'{label}.{path}'))
+            logger.info('Thread %s: %s.%s is a local path; it is sent and recorded as "%s".', thread_id, label, path, LOCAL_PATH_MARKER)
     return wire.state
 
 
@@ -781,12 +794,13 @@ def _as_recorded(echoes: list[dict[str, Any]], reference_of: Mapping[str, str]) 
     """Echoed user messages as the transcript records a user turn: a string leaf equal to a fold is its ``<scheme>:///`` reference.
 
     An echo is the agent's copy of the turn it received, bytes included. It goes through the projection
-    ``agent_state`` rides (:func:`~plurai.orchestrator.state_wire.wire_agent_state`), so a handed-over
+    ``agent_state`` rides without the Run info rule (:func:`~plurai.orchestrator.state_wire.wire_value`):
+    an echo is a user message, not a turn's state. So a handed-over
     document is not stored a second time as a multi-megabyte ``data:`` URI whatever shape the
     framework gave the echo, and a string leaf over the wire cap is a descriptor. A bare base64
     payload without the ``data:`` header is not a fold and stays.
     """
-    return [wire_agent_state(msg, served=reference_of).state or msg for msg in echoes]
+    return [wire_value(msg, served=reference_of).state or msg for msg in echoes]
 
 
 def _seed_for_agent(seed: dict[str, Any] | None, served: Mapping[str, str]) -> dict[str, Any] | None:
@@ -1616,16 +1630,19 @@ HARNESS_CUT_REASONS: frozenset[str] = frozenset({TIME_BUDGET_REASON, PROVIDER_IN
 RELAYED_REASONS: frozenset[str] = frozenset({TIME_BUDGET_REASON, AGENT_RAISED_REASON, AGENT_RECURSION_REASON, PROVIDER_INFRA_REASON, TURN_BUDGET_REASON})
 
 
-def _turn_failure_record(exc: BaseException, *, turn_idx: int, closing: bool) -> dict[str, Any]:
+def _turn_failure_record(exc: BaseException, *, turn_idx: int, closing: bool, project: Path | None = None) -> dict[str, Any]:
     """``ThreadResult.turn_failure``: the failed turn, typed by its raiser (``kind`` is ``None`` for an
-    untyped raise), with the exception's own words — the ``error.json`` field names."""
+    untyped raise), with the exception's own words — the ``error.json`` field names.
+
+    The words reach the transcript, so they pass the rule for SDK-written texts: a raise site that already wrote them
+    that way leaves them unchanged, and a path from one that did not is written from ``project`` or is the stand-in."""
     return {
         'turn_idx': turn_idx,
         'closing': closing,
         'kind': getattr(type(exc), 'kind', None),
         'exception': type(exc).__name__,
         'child_exc_class': getattr(exc, 'child_exc_class', None),
-        'error': str(exc) or repr(exc),
+        'error': shippable_text(str(exc) or repr(exc), project=project),
     }
 
 
@@ -2875,11 +2892,13 @@ def _refuse_undeclared_input(content: str | list[dict[str, Any]] | None, declare
         surface = f'declares no `{AGENT_IO_KEY}` in its {CONFIG_FILENAME}, so it takes the default of {" and ".join(agent_io.input_parts)} only'
     else:
         surface = f'declares `{AGENT_IO_KEY}` in its {CONFIG_FILENAME}, which accepts the part kinds {list(agent_io.input_parts)}'
-    raise HarnessUndeclaredInput(
+    raise shipped_error(
+        HarnessUndeclaredInput,
         f'refusing to run scenario {scenario_id!r}: the {turn} hands the agent a content part of kind {", ".join(map(repr, missing))}, '
         f'but {simulate_path} {surface}. '
         f'Scoring it would grade an agent that was never shown what the user sent. Declare the kind in `{AGENT_IO_KEY}.{INPUT_FIELD}` '
-        f'(and read it in `invoke_agent`), or remove the hand-over from the scenario.'
+        f'(and read it in `invoke_agent`), or remove the hand-over from the scenario.',
+        project=harness_project(simulate_path),
     )
 
 
@@ -3493,7 +3512,10 @@ class Orchestrator:
             # The scenario's channel plan, checked against the harness's ``agent.io.channels`` before any child
             # is up: a scenario that plants into a channel this harness never declared is the same mismatch as an
             # undeclared content part, and is refused the same way. The CHILD applies it (``plurai.child``).
-            declared_by = f'{self.simulate_path} ({CONFIG_FILENAME})' if declared_io is None or declared_io.source is None else str(declared_io.source)
+            declared_by = shippable_text(
+                f'{self.simulate_path} ({CONFIG_FILENAME})' if declared_io is None or declared_io.source is None else str(declared_io.source),
+                project=harness_project(self.simulate_path),
+            )
             channel_plan = parse_channel_plan(thread.scenario_metadata, declared_io, scenario_id=scenario_id, declared_by=declared_by)
             # THE DISPATCH. A pipeline bench is one structured call, not a
             # conversation: it has no ``invoke_agent`` for the loop below to drive, so driving it
@@ -3548,10 +3570,12 @@ class Orchestrator:
                 # would be the user-first run the declaration exists to prevent, silently. A RESUMED
                 # thread is exempt: its conversation is under way, so its opener is the user's
                 # continuation line and the server ignores ``agent_opens`` there by design.
-                raise WorkspaceConfigError(
+                raise shipped_error(
+                    WorkspaceConfigError,
                     f'refusing to run scenario {scenario_id!r}: {self.simulate_path} declares `agent.io: {{{OPENS_FIELD}: {OPENS_ALWAYS}}}` '
                     f'in its {CONFIG_FILENAME}, but the server answered `agent_opens` with a user opener. The backend predates the '
-                    f'field — upgrade the Plurai backend, or drop the declaration to run first_talk as turn 0.'
+                    f'field — upgrade the Plurai backend, or drop the declaration to run first_talk as turn 0.',
+                    project=harness_project(self.simulate_path),
                 )
             if replay_turn_only and opener is None:
                 # A single-hop replay delivers the scenario's OPENER as the turn under test; with none
@@ -3579,13 +3603,15 @@ class Orchestrator:
                 # second table: two readers of one declaration would eventually disagree about which
                 # benches may open, and the disagreement would surface as this refusal firing on a
                 # bench the child would have driven perfectly well.
-                raise HarnessNoOpener(
+                raise shipped_error(
+                    HarnessNoOpener,
                     f'refusing to run scenario {scenario_id!r}: it has no opening user message (the server sent neither '
                     f'`initial_messages` nor `initial_message`), '
                     f'but {self.simulate_path} does not declare `agent.io: {{may_open: true}}` in its {CONFIG_FILENAME}. '
                     f'An agent that opens the conversation is called with `{{"messages": []}}` on turn 0, which a harness that never '
                     f'declared it would raise on. Declare it (and make invoke_agent greet on an empty message list), or give the '
-                    f'scenario a first_talk so the simulated user speaks first.'
+                    f'scenario a first_talk so the simulated user speaks first.',
+                    project=harness_project(self.simulate_path),
                 )
             # A missing opener is a POSITIVE statement — the scenario has no user first line and
             # the AGENT opens (the declared ``agent.io.may_open`` shape).
@@ -3838,7 +3864,7 @@ class Orchestrator:
                         reason = self._landing_reason(exc)
                         if reason is None or not transcript_turns:
                             raise
-                        turn_failure = _turn_failure_record(exc, turn_idx=turn_idx, closing=False)
+                        turn_failure = _turn_failure_record(exc, turn_idx=turn_idx, closing=False, project=harness_project(self.simulate_path))
                         ended_early = ended_early or reason
                         child_reaped = isinstance(exc, AgentTurnTimeout)
                         # The act she took with her last message was applied (or refused) before the
@@ -4351,7 +4377,7 @@ class Orchestrator:
                         if closing_user_action_result is None and (raised := _raised_turn_user_action_result(child)) is not None:
                             closing_user_action_result = raised
                             _file_user_action_result(transcript_turns, raised)
-                        turn_failure = _turn_failure_record(closing_exc, turn_idx=closing_turn_idx, closing=True)
+                        turn_failure = _turn_failure_record(closing_exc, turn_idx=closing_turn_idx, closing=True, project=harness_project(self.simulate_path))
                         child_reaped = isinstance(closing_exc, AgentTurnTimeout)
                         logging.getLogger(__name__).warning(
                             'closing-turn delivery failed on thread %s; finalizing without a closing reply',
@@ -4686,6 +4712,8 @@ class Orchestrator:
                     events = again_events
                 if more:
                     unanswered = [*(unanswered or []), *more]
+        # ``failed`` holds the child's detail as written, for the operator's log. The returned ``capture_failed`` is the
+        # text the transcript's metadata and the report's finding record: ``failed`` with the strict rule applied.
         failed: dict[str, str] = {}
         if isinstance(world, dict) and _FINALIZE_ERROR_MARKER in world:
             failed['world'], world = str(world[_FINALIZE_ERROR_MARKER]), None
@@ -4704,7 +4732,7 @@ class Orchestrator:
             world,
             client_factory=self.storage_client_factory or self._run_storage_client,
         )
-        return world, events, unanswered, failed or None
+        return world, events, unanswered, shippable_text(failed, project=harness_project(self.simulate_path)) or None
 
     async def _run_pipeline_hop(
         self,
@@ -4799,12 +4827,15 @@ class Orchestrator:
                 # component, so it is scored rather than reported as infra.
                 # The COMPONENT's own words reach the judge; the SDK's wrapper prose
                 # ("pipeline_invoke failed on thread …") stays in the log below.
-                pipeline_error = {'exception': type(exc).__name__, 'error': getattr(exc, 'child_message', None) or str(exc)}
+                # The one text both carriers hold: the ``/finalize`` body the judges read and ``pipeline_io.error`` a
+                # re-score reads. It is written with the strict rule for SDK-written texts here, where it is built.
+                local_error = getattr(exc, 'child_message', None) or str(exc)
+                pipeline_error = {'exception': type(exc).__name__, 'error': shippable_text(local_error, project=harness_project(self.simulate_path))}
                 if child_exc_class := getattr(exc, 'child_exc_class', None):
                     pipeline_error['child_exc_class'] = child_exc_class
                 if isinstance(exc, ProviderInfra):
                     ended_early = PROVIDER_INFRA_REASON
-                    turn_failure = _turn_failure_record(exc, turn_idx=0, closing=False)
+                    turn_failure = _turn_failure_record(exc, turn_idx=0, closing=False, project=harness_project(self.simulate_path))
                 if getattr(exc, 'timed_out', False):
                     pipeline_error['timed_out'] = True
                     # ``_send_and_wait`` SIGTERM/SIGKILLs the child before raising the turn
@@ -4816,7 +4847,7 @@ class Orchestrator:
                     'failure — the run finalizes with `pipeline_error` set, which a judge and a code_eval policy '
                     'can both read.',
                     thread.thread_id,
-                    pipeline_error['error'],
+                    local_error,
                 )
             else:
                 if hop is not None:
@@ -4864,7 +4895,7 @@ class Orchestrator:
         # The outputs as the wire and the transcript carry them: a served document the pipeline echoes is its
         # reference, so ``pipeline_outputs`` stays under the request limit beside ``pipeline_inputs``.
         raw_outputs = outputs
-        outputs = _wire_state_of(outputs, _reference_by_fold(served_documents), thread_id=thread.thread_id, label='pipeline_outputs') or {}
+        outputs = _wire_state_of(outputs, _reference_by_fold(served_documents), thread_id=thread.thread_id, label='pipeline_outputs', turn_state=False) or {}
 
         # Shaped BEFORE /finalize is submitted, not at the TranscriptTurn below: ``_json_shaped``
         # is the only raise site left in this tail, and a raise AFTER the submit would leave the
@@ -5002,6 +5033,23 @@ class Orchestrator:
 
     # -- async finalize --
 
+    async def _thread_is_completed(self, thread_id: str) -> bool:
+        """Whether ``GET /threads/{id}`` answers that the thread is ``completed``.
+
+        Any other outcome (another status, a 404, a 5xx, a transport error, an unreadable body) answers ``False``: an
+        inconclusive probe never turns a 404 into an expired result.
+        """
+        try:
+            thread = await self.client.get_thread(thread_id)
+        except Exception:  # noqa: BLE001 - an unusable probe is a "no", never a "yes"
+            logging.getLogger(__name__).debug('thread probe for %s was inconclusive', thread_id, exc_info=True)
+            return False
+        return thread.status == 'completed'
+
+    async def _poll_404_is_expired(self, exc: httpx.HTTPError, thread_id: str) -> bool:
+        """Whether a failed finalize poll is a 404 for a thread the server reports ``completed``: a result that expired."""
+        return isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 404 and await self._thread_is_completed(thread_id)
+
     async def _finalize_async(
         self,
         thread_id: str,
@@ -5042,6 +5090,8 @@ class Orchestrator:
         - ``done``    → clear ``_inflight_finalize_job_id``; return ``FinalizeResponse``.
         - ``failed``  → clear ``_inflight_finalize_job_id``; raise ``FinalizeJobFailed``, or ``CreditRefused`` when
           the job ended on a credit refusal.
+        - Poll 404 on a thread ``GET /threads/{id}`` reports ``completed`` → clear ``_inflight_finalize_job_id``; raise
+          ``FinalizeResultExpired``: the conversation was scored and only its stored result is gone.
         - Schema drift (``ValidationError``) → clear ``_inflight_finalize_job_id``; raise
           ``OrchestratorAdapterError`` (unrecognised status from server is a fast-fail).
         - Budget exceeded → raise ``FinalizePollTimeout`` (``_inflight_finalize_job_id``
@@ -5138,7 +5188,13 @@ class Orchestrator:
                 ) from exc
             except httpx.HTTPError as exc:
                 if not is_transient_for_idempotent(exc):
-                    # An answer ABOUT the job (a 404, a 401): terminal, the inflight id left set so cancel-on-abandon runs.
+                    # A 404 on a thread the server reports completed is a result that expired: the conversation was
+                    # scored and only the stored result is gone. Every other answer ABOUT the job (a 401, a 404 with
+                    # the thread gone or the probe inconclusive) is terminal, the inflight id left set so cancel-on-abandon
+                    # runs.
+                    if await self._poll_404_is_expired(exc, thread_id):
+                        self._inflight_finalize_job_id = None
+                        raise FinalizeResultExpired(thread_id=thread_id, job_id=submit.job_id) from exc
                     raise
                 # The CLIENT could not reach the job: a timeout after the connection was made, a name that stopped
                 # resolving, or an outage that spent the request's own budget (a connection failure or a 502, 503 or 504).

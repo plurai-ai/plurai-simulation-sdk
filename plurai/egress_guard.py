@@ -112,7 +112,6 @@ class _Guard:
         self._shared: set[str] = set()  # every address ever answered for a name that is not declared
         self._seen: set[tuple[str, str, str | None]] = set()
         self._busy = threading.local()
-        self._cwd = os.path.realpath(Path.cwd())
         self.add_hosts(str(h) for h in spec.get('deny') or ())
 
     def add_hosts(self, hosts: Any) -> None:
@@ -219,7 +218,8 @@ class _Guard:
 
     def _callsite(self) -> str | None:
         """The first frame outside the stdlib, site-packages and this SDK (``<string>`` is ``python -c`` code);
-        else the first library frame, by file name only."""
+        else the first library frame, by file name only. The file is named as it is on this machine: the parent writes
+        the row into ``run_summary.json`` and applies the rule for texts that leave the machine there."""
         frame = sys._getframe(1)
         first: str | None = None
         while frame is not None:
@@ -227,7 +227,7 @@ class _Guard:
             if raw != __file__:
                 path = os.path.realpath(raw)
                 if not raw.startswith('<frozen') and not path.startswith(_LIBRARY_ROOTS):
-                    return f'{os.path.relpath(path, self._cwd) if path.startswith(self._cwd + os.sep) else raw}:{frame.f_lineno}'
+                    return f'{raw if raw.startswith("<") else path}:{frame.f_lineno}'
                 first = first or f'{Path(raw).name}:{frame.f_lineno}'
             frame = frame.f_back
         return first

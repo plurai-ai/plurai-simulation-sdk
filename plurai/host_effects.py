@@ -39,6 +39,7 @@ import signal
 import site
 import stat
 import sys
+import sysconfig
 import tempfile
 import time
 from collections.abc import Awaitable, Callable, Iterable, Iterator, Mapping, Sequence
@@ -50,6 +51,7 @@ from typing import Any, Literal, cast
 from plurai._platform import is_windows
 from plurai._protocol import TRAIL_REFUSAL_KEY, TRAIL_STATUS_DENIED, HarnessFault
 from plurai.credentials import MIN_TOKEN_LENGTH
+from plurai.orchestrator.local_paths import LOCAL_PATH_MARKER
 
 #: The sidecar's name, beside ``.probe_consent`` in the bench's ``plurai_sim/`` directory.
 CONSENT_FILENAME = '.host_effects_consent'
@@ -1684,9 +1686,7 @@ class CliAgentUnsupportedOnWindows(HarnessFault):  # noqa: N818 - a HarnessFault
 def _scenario_roots_parent(*, is_win: bool | None = None) -> Path:
     # Every confined scenario root comes through here; its per-user /tmp parent, sandbox and signals are POSIX.
     if is_windows() if is_win is None else is_win:
-        raise CliAgentUnsupportedOnWindows(
-            'CLI-driven agents are not supported on native Windows yet; run this agent under WSL or on macOS/Linux'
-        )
+        raise CliAgentUnsupportedOnWindows('CLI-driven agents are not supported on native Windows yet; run this agent under WSL or on macOS/Linux')
     return _SCENARIO_ROOTS_DIR / f'plurai-{os.getuid()}'
 
 
@@ -1894,6 +1894,649 @@ def scrub_parent_record(obj: Any, *, repo: str | Path) -> Any:
     leave this machine: :meth:`HostReadScope.scrub`, with ``repo`` read as allowed — so its paths
     ship whole from ``~``, and no path names the operator."""
     return host_read_scope(run_dir=None, repo=repo, harness=None).scrub(obj)[0]
+
+
+#: A path character in free text: not whitespace or a control character, a quote, shell punctuation or ``:`` (which starts a
+#: ``:line`` suffix).
+_PATH_CHAR = r"""[^\s\x00-\x1f\x7f'"`;|&<>(){}\[\],:]"""
+
+#: The rest of a path after its root.
+_PATH_RUN = re.compile(_PATH_CHAR + '*')
+
+#: Words the service reads as an infrastructure outage in an untyped error (a status code, a timeout, a capacity
+#: phrase). A project-relative path that spells one ships as the stand-in, so the rule never creates one.
+_OUTAGE_WORDS = re.compile(
+    r'\b[45]\d\d\b|resource[ _-]?exhausted|timed?[ _-]?out|connection|unavailable|overloaded|rate[ _-]?limit|quota|exhaust|capacity|throttl'
+    r'|per[ _-]?(?:minute|second)',
+    re.IGNORECASE,
+)
+
+_NOT_A_PATH_END = '.'
+
+#: How many passes make a text stable: a project-relative result can itself hold a spelling of a root.
+_MAX_PASSES = 4
+
+#: A ``file:`` URL prefix (``file:``, ``file://``, ``file://localhost``) at the end of the text before a root.
+_FILE_PREFIX = re.compile(r'(?<![\w+.-])file:(?://(?:localhost)?)?$', re.IGNORECASE)
+
+#: A part of a package's path after its ``site-packages`` folder: word characters, dots, hyphens and plus signs.
+_PACKAGE_SEGMENT = re.compile(r'[\w.+-]+')
+
+#: Spellings of a slash inside a string: JSON-escaped, ``/``-escaped and percent-encoded (a run of ``%XX``, so a
+#: multi-byte character decodes whole). The text is decoded up to :data:`_MAX_PASSES` times, to find a root, never to
+#: rewrite the text.
+_ENCODED = re.compile(r'(?:%[0-9A-Fa-f]{2})+|\\/|\\u002f', re.IGNORECASE)
+
+
+def _decoded_view(text: str) -> tuple[str, list[int] | None, list[int] | None]:
+    """``text`` with its escaped and percent-encoded spellings decoded, and for every character of the result where it
+    starts and ends in ``text`` (``None, None`` when nothing decodes: the view is ``text`` itself). A decoded character
+    maps to the whole escape it came from, so a span of the view maps back to a span of ``text`` that covers it."""
+    starts: list[int] | None = None
+    ends: list[int] | None = None
+    for _ in range(_MAX_PASSES):
+        if _ENCODED.search(text) is None:
+            break
+        if starts is None or ends is None:
+            starts, ends = list(range(len(text))), list(range(1, len(text) + 1))
+        out: list[str] = []
+        new_starts: list[int] = []
+        new_ends: list[int] = []
+        pos = 0
+        for m in _ENCODED.finditer(text):
+            out.append(text[pos : m.start()])
+            new_starts += starts[pos : m.start()]
+            new_ends += ends[pos : m.start()]
+            chunk = m.group()
+            decoded = bytes.fromhex(chunk.replace('%', '')).decode('utf-8', errors='replace') if chunk[0] == '%' else '/'
+            out.append(decoded)
+            new_starts += [starts[m.start()]] * len(decoded)
+            new_ends += [ends[m.end() - 1]] * len(decoded)
+            pos = m.end()
+        out.append(text[pos:])
+        new_starts += starts[pos:]
+        new_ends += ends[pos:]
+        text, starts, ends = ''.join(out), new_starts, new_ends
+    return text, starts, ends
+
+
+@functools.lru_cache(maxsize=1)
+def _interpreter_roots() -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """The folders this interpreter lives in (its prefixes) and the ones it imports packages from (``site-packages``), read
+    once: the interpreter does not move during a run."""
+    paths = sysconfig.get_paths()
+    sites = dict.fromkeys(p for p in (*_site_dirs(), paths.get('purelib'), paths.get('platlib')) if p)
+    return tuple(p for p in (sys.prefix, sys.base_prefix, sys.exec_prefix, sys.base_exec_prefix) if p), tuple(sites)
+
+
+def _alternation(words: Iterable[str]) -> str:
+    """A regex group that matches any of ``words``, longest first, then in text order, so the pattern is the same for the
+    same set whatever order the set iterates in."""
+    return '(?:' + '|'.join(re.escape(w) for w in sorted(words, key=lambda w: (-len(w), w))) + ')'
+
+
+#: Stands in for the ``user:password@`` part of a URL. It holds no digit and no character a URL's userinfo may hold.
+USERINFO_STAND_IN = '[plurai: credentials not sent]'
+
+#: The userinfo of a ``scheme://`` URL in a text as written: everything after ``://`` up to the last ``@`` that comes before
+#: the first ``/``, ``?``, ``#``, whitespace or quote. An encoded character (``%2F``, ``%40``) is part of it, so it is read in
+#: the text as written, never in a decoded view. Fail closed: ``https://api.example.com:443,admin@corp.example`` (a URL, a comma
+#: and an address) reads as userinfo too.
+_USERINFO = re.compile(r"""(?<=://)[^\s/?#'"`]+@""")
+
+
+def _root_form(root: str) -> str:
+    """``root`` (a path with ``/`` separators) as a regex that also reads a drive letter, a rooted backslash and mixed or
+    doubled separators between its folders: ``/Users/jane`` matches ``\\Users\\jane`` and ``C:/Users//jane``. It starts at one
+    separator, so a long run of separators costs one step per character."""
+    return r'(?:(?<!\w)[A-Za-z]:)?[\\/]' + r'[\\/]+'.join(re.escape(segment) for segment in root.strip('/').split('/'))
+
+
+@dataclass(frozen=True)
+class _HomeSpellings:
+    """The home as the pattern needs it: its spellings as a path and the user names (``~<name>``)."""
+
+    forms: frozenset[str] = frozenset()
+    names: frozenset[str] = frozenset()
+
+    @property
+    def dashed(self) -> frozenset[str]:
+        """The home with its slashes written as hyphens (``-Users-jane``), for a home of two folders or more."""
+        return frozenset(h.replace('/', '-') for h in self.forms if h.count('/') >= 2)
+
+    @property
+    def tails(self) -> frozenset[str]:
+        """The last two folders of the home (``home/jane``): a relative spelling of it."""
+        return frozenset('/'.join(h.strip('/').split('/')[-2:]) for h in self.forms if h.count('/') >= 2)
+
+
+@functools.lru_cache(maxsize=32)
+def _roots_pattern(posix: frozenset[str], windows: frozenset[str], home: _HomeSpellings, *, fold: bool) -> re.Pattern[str]:
+    """The one pattern that finds a spelling of a known root in a text, as the named group that says which kind:
+
+    * ``windows`` — a root with a drive, either separator, any case, and an extended-length prefix;
+    * ``deep`` — a root of two folders or more (``/Users/jane``), found anywhere, glued to a word included;
+    * ``shallow`` — a root of one folder (``/root``, ``/app``), which is also an ordinary segment of a relative path or a
+      URL (``https://pypi.org/simple/root/``): found only where it does not follow a word character, ``.``, ``~`` or ``-``;
+    * ``tail`` — the last two folders of the home with no root before them (``home/jane/x``), a spelling of the home;
+    * ``tilde`` — the home as ``~/``, ``~<user>``, ``$HOME`` or ``${HOME}``, each not followed by a word character (``$HOMEBREW``
+      and ``~janet`` are no spelling of the home, ``~jane.`` and ``$HOME,`` are), and a bare ``~`` names nothing;
+    * ``dashed`` — the home with its slashes written as hyphens, as a tool names a folder after it.
+
+    Every alternation is a group of its own, so a boundary in front of it guards every alternative. A posix root also
+    reads a drive letter, a rooted backslash and mixed separators, and ignores case where the file system does
+    (``fold``). A root ends at a path separator or at a character that is no part of a path token, so ``/Users/jane`` is
+    not found in ``/Users/janet``.
+    """
+    end = rf'(?=[\\/]|(?!{_PATH_CHAR}))'
+    case = '(?i:{})' if fold else '(?:{})'
+
+    def posix_forms(roots: Iterable[str]) -> str:
+        return case.format('|'.join(_root_form(r) for r in sorted(roots, key=lambda r: (-len(r), r))))
+
+    parts: list[str] = []
+    if windows:
+        forms = [r'[\\/]+'.join(re.escape(segment) for segment in w.split('/') if segment) for w in sorted(windows, key=lambda w: (-len(w), w))]
+        parts.append(rf'(?P<windows>(?<![\w.~$/\\-])(?:\\\\[?.]\\)?(?i:{"|".join(forms)}){end})')
+    if deep := [r for r in posix if r.count('/') > 1]:
+        parts.append(rf'(?P<deep>{posix_forms(deep)}){end}')
+    if shallow := [r for r in posix if r.count('/') == 1]:
+        parts.append(rf'(?P<shallow>(?<![\w.~-]){posix_forms(shallow)}){end}')
+    if tails := home.tails:
+        forms = '|'.join(r'[\\/]+'.join(re.escape(segment) for segment in t.split('/')) for t in sorted(tails, key=lambda t: (-len(t), t)))
+        parts.append(rf'(?P<tail>(?<![\w.~$/\\-]){case.format(forms)}){end}')
+    if home.forms:
+        names = f'~{_alternation(home.names)}(?!\\w)|' if home.names else ''
+        parts.append(rf'(?P<tilde>(?<![\w.~$/\\-])(?:~(?=[\\/])|{names}\$\{{HOME\}}(?!\w)|\$HOME(?!\w)))')
+    if dashed := home.dashed:
+        parts.append(rf'(?P<dashed>(?<![\w-]){_alternation(dashed)})(?=-|(?![\w.]))')
+    return re.compile('|'.join(parts))
+
+
+class _Shippable:
+    """One pass of :func:`shippable_text`: the folders of this machine, read once.
+
+    The rule knows the folders the operator owns (:meth:`_read_known_roots`): the home, the project, the working folder, the
+    temporary folder and the folders of the running interpreter. It finds a spelling of one of them in a text and replaces
+    the path from there to its end; every other byte of the text ships as it was.
+
+    Nothing here raises: a folder that cannot be read (a deleted working folder, no home) is left out, and a text
+    whose rewrite fails ships as :data:`~plurai.orchestrator.local_paths.LOCAL_PATH_MARKER` whole.
+    """
+
+    def __init__(self, project: str | Path | None) -> None:
+        try:
+            home = Path(os.path.normpath(Path.home()))
+        except (RuntimeError, OSError, KeyError):
+            home = Path('/')
+        self.scope = HostReadScope(home=home, deny=(), allow=())
+        self.changed = 0
+        self.project_forms: tuple[str, ...] = ()
+        self.project_windows = ''
+        home_real = _realpath(home)
+        self.user_names = frozenset({home.name, Path(home_real).name} - {''}) if home.parent != home else frozenset()
+        project_path = _absolute(project) if project is not None else None
+        if project_path is not None and not self._holds_a_home(project_path, home_real):
+            self.project_forms = tuple(dict.fromkeys((*_forms(project_path), _realpath(project_path))))
+            self.project_windows = _windows_form(str(project))
+        self._read_known_roots(home)
+
+    def _read_known_roots(self, home: Path) -> None:
+        """Read the folders of this machine, once, and build the pattern that finds them."""
+        try:
+            cwd: Path | None = Path(os.path.normpath(Path.cwd()))
+        except OSError:
+            cwd = None
+        prefixes, sites = _interpreter_roots()
+        folders = [*([cwd] if cwd else []), Path(tempfile.gettempdir()), *(Path(p) for p in (*prefixes, *sites))]
+        spellings = {form for folder in folders for form in _forms(folder)} | set(self.project_forms)
+        home_forms = frozenset(self.scope._home_forms) - {'/'} if self.user_names else frozenset()  # noqa: SLF001
+        self.site_dirs: tuple[str, ...] = tuple(dict.fromkeys(_windows_form(f) or f for site in sites for f in _forms(Path(site))))
+        windows = {_windows_form(f) for f in spellings if re.match(r'[A-Za-z]:', f) and _windows_form(f)} | ({self.project_windows} - {''})
+        posix = {f for f in spellings | home_forms if f not in ('', '/') and not (re.match(r'[A-Za-z]:', f) and _windows_form(f))}
+        self.pattern = _roots_pattern(frozenset(posix), frozenset(windows), _HomeSpellings(home_forms, self.user_names), fold=_CASE_FOLDING)
+
+    def _holds_a_home(self, project: Path, home_real: str) -> bool:
+        """Whether a path relative to ``project`` could spell the user: it is the home folder, a folder above it
+        (``/Users``, ``/home``, ``/``) or a users folder, so ``Users/<user>/…`` would be a relative path."""
+        home = self.scope.home
+        return any(_under(h, project) for h in (home, home_real)) or project.parent == project or project.as_posix() in ('/Users', '/home')
+
+    def names_the_user(self, shown: str) -> bool:
+        """Whether a relative path has a segment that is the user name or the home folder's name."""
+        return any(segment in self.user_names for segment in re.split(r'[\\/]', shown))
+
+    def relative(self, path: str) -> str | None:
+        """``path`` (absolute, normalised) relative to the project, or ``None`` when it lies outside it."""
+        if not self.project_forms:
+            return None
+        root = next((r for r in self.project_forms if _under(path, r)), None)
+        return None if root is None else path[len(root) :].strip('/') or '.'
+
+    def stand_in(self, path: str, *, text: bool = False) -> str:
+        """``path`` as a record may show it: relative to the project when it lies under it, else the stand-in. In a free
+        text (``text``) a path outside the project that lies in a ``site-packages`` folder of this interpreter keeps the part
+        from the package on (:meth:`package_frame`)."""
+        shown = self.relative(path)
+        if shown is None:
+            return self.package_frame(path) if text else LOCAL_PATH_MARKER
+        return LOCAL_PATH_MARKER if _OUTAGE_WORDS.search(shown) or self.names_the_user(shown) else shown
+
+    def package_frame(self, path: str) -> str:
+        """The stand-in followed by the part of ``path`` after a ``site-packages`` folder this interpreter imports from
+        (``<stand-in>langgraph/pregel/main.py``): the package's own file names hold nothing of the machine and tell which
+        library a traceback frame is in. The stand-in alone when the path is in no such folder, a segment of the part
+        is empty, ``.``, ``..`` or no package file name, or the part spells an outage word or the user name. The result
+        holds no absolute path, so shipping it again changes nothing."""
+        slashed = path.replace('\\', '/')
+        for folder in self.site_dirs:
+            if _under(slashed, folder) and slashed != folder:
+                rest = slashed[len(folder.rstrip('/')) + 1 :]
+                segments = rest.split('/')
+                named = all(_PACKAGE_SEGMENT.fullmatch(s) and s not in ('.', '..') for s in segments)
+                if named and not (_OUTAGE_WORDS.search(rest) or self.names_the_user(rest)):
+                    return LOCAL_PATH_MARKER + rest
+                break
+        return LOCAL_PATH_MARKER
+
+    def posix(self, token: str) -> str:
+        body = token.rstrip(_NOT_A_PATH_END)
+        end = token[len(body) :]
+        if body[:1] not in ('/', '~', '$'):  # a drive letter or a rooted backslash spells the same path
+            body = re.sub(r'^[A-Za-z]:', '', body).replace('\\', '/')
+        return self.stand_in(os.path.normpath(self.scope._expand(body)), text=True) + end  # noqa: SLF001
+
+    def windows(self, token: str, *, text: bool = False) -> str:
+        body = token.rstrip(_NOT_A_PATH_END)
+        end = token[len(body) :]
+        slashed = _windows_form(body)
+        root = self.project_windows
+        if root and (slashed.casefold() == root.casefold() or slashed.casefold().startswith(root.casefold() + '/')):
+            shown = slashed[len(root) :].strip('/') or '.'
+            return (LOCAL_PATH_MARKER if _OUTAGE_WORDS.search(shown) or self.names_the_user(shown) else shown) + end
+        return (self.package_frame(slashed) if text else LOCAL_PATH_MARKER) + end
+
+    @staticmethod
+    def _token_end(view: str, end: int, starts: list[int] | None, ends: list[int] | None) -> int:
+        """Where the path token that has read up to ``view[end]`` ends: at the first whitespace or shell punctuation. A
+        space that came from an escape (``%20``) is part of the token, so a ``file:`` or percent-encoded path, which
+        carries its spaces encoded, is whole."""
+        while True:
+            end = _PATH_RUN.match(view, end).end()  # type: ignore[union-attr]  # ``*`` always matches
+            if starts is None or ends is None or end >= len(view) or not view[end].isspace() or ends[end] - starts[end] < 2:
+                return end
+            end += 1
+
+    def once(self, text: str) -> str:
+        """``text`` with every path under a known root replaced, from the root to the end of the path: relative to the
+        project when it lies under it, else the stand-in. The path ends at the first whitespace, or at the closing quote when
+        a quote opened before it on the same line. A root is found in the text as written and in its decoded view
+        (JSON-escaped, ``\\u002f`` and percent-encoded slashes), and a span found in the view is replaced in the text it
+        came from, so every other byte ships as it was. The ``user:password@`` of a URL is replaced in the text as written."""
+        text = _USERINFO.sub(f'{USERINFO_STAND_IN}@', text)
+        view, starts, ends = _decoded_view(text)
+        edits: list[tuple[int, int, str]] = []
+        for m in _USERINFO.finditer(view):  # the userinfo of a URL spelled with an escaped separator (``https%3A%2F%2Fu%3Ap%40h``)
+            edits.append((m.start(), m.end(), f'{USERINFO_STAND_IN}@'))
+        spans = [(start, end) for start, end, _ in edits]
+        quotes = {q: [0, -1] for q in '\'"`'}  # per quote character: how many came before the match on this line, and the last
+        pos = line_end = scanned = ui = 0
+        while (m := self.pattern.search(view, pos)) is not None:
+            kind = m.lastgroup
+            start = m.start()
+            while ui < len(spans) and spans[ui][1] <= start:
+                ui += 1
+            if ui < len(spans) and spans[ui][0] < m.end():  # inside a userinfo
+                pos = spans[ui][1]
+                continue
+            if m.end() > line_end:  # a new line: its end and its quotes are looked up once
+                line_end = view.find('\n', m.end())
+                line_end = len(view) if line_end < 0 else line_end
+                scanned = view.rfind('\n', 0, start) + 1
+                quotes = {q: [0, -1] for q in quotes}
+            for q, state in quotes.items():
+                i = view.find(q, scanned, start)
+                while i != -1:
+                    state[:] = [state[0] ^ 1, i]
+                    i = view.find(q, i + 1, start)
+            scanned = start
+            file_url = _FILE_PREFIX.search(view, max(0, start - 17), start)
+            inside = max((state[1], q) for q, state in quotes.items() if state[0])[1] if any(state[0] for state in quotes.values()) else None
+            closing = view.find(inside, m.end(), line_end) if inside else -1
+            end = closing if closing >= 0 else self._token_end(view, m.end(), starts, ends)
+            token = view[start:end]
+            if file_url or kind in ('dashed', 'tail'):
+                replaced = LOCAL_PATH_MARKER
+            elif kind == 'windows':
+                replaced = self.windows(token, text=True)
+            else:
+                replaced = self.posix(token)
+            edits.append((file_url.start() if file_url else start, end, replaced))
+            pos = max(end, m.end())
+        if not edits:
+            return text
+        out: list[str] = []
+        at = 0
+        for start, end, replaced in sorted(edits, key=lambda edit: edit[:2]):
+            first = start if starts is None else starts[start]
+            last = end if ends is None else ends[end - 1]
+            first = max(first, at)
+            out += [text[at:first], replaced]
+            at = max(last, first)
+        out.append(text[at:])
+        return ''.join(out)
+
+    def text(self, text: str) -> str:
+        try:
+            shipped = text
+            for _ in range(_MAX_PASSES):
+                again = self.once(shipped)
+                if again == shipped:
+                    break
+                shipped = again
+            else:
+                shipped = LOCAL_PATH_MARKER
+        except Exception:  # noqa: BLE001 - a rule that cannot read a text never ships it raw
+            shipped = LOCAL_PATH_MARKER
+        self.changed += shipped != text
+        return shipped
+
+    def key(self, key: str, taken: dict[Any, Any]) -> str:
+        """``key`` shipped, numbered (``<key> #2``) when another key of the same object already ships as that text."""
+        shipped = self.text(key)
+        if shipped not in taken:
+            return shipped
+        n = 2
+        while f'{shipped} #{n}' in taken:
+            n += 1
+        return f'{shipped} #{n}'
+
+    def walk(self, obj: Any) -> Any:
+        if isinstance(obj, str):
+            return self.text(obj)
+        if isinstance(obj, os.PathLike):
+            return self.text(os.fspath(obj)) if isinstance(os.fspath(obj), str) else obj
+        if isinstance(obj, list | tuple):
+            return [self.walk(v) for v in obj]
+        if isinstance(obj, dict):
+            out: dict[Any, Any] = {}
+            for k, v in obj.items():
+                out[self.key(k, out) if isinstance(k, str) else k] = self.walk(v)
+            return out
+        return obj
+
+
+def _realpath(path: str | Path) -> str:
+    """``os.path.realpath``, or the path as given when it cannot be resolved (an embedded NUL)."""
+    try:
+        return os.path.realpath(path)
+    except (OSError, ValueError):
+        return str(path)
+
+
+def _absolute(path: str | Path) -> Path | None:
+    try:
+        return Path(os.path.normpath(Path(path).absolute()))
+    except (OSError, ValueError):
+        return None
+
+
+def _forms(path: Path) -> tuple[str, ...]:
+    try:
+        return tuple(str(p) for p in _both_forms([path]))
+    except (OSError, ValueError, RuntimeError):
+        return (str(path),)
+
+
+def _windows_form(path: str) -> str:
+    """``path`` with ``/`` separators when it is a Windows drive, UNC, extended-length or rooted path, else ``''``."""
+    return path.replace('\\', '/').rstrip('/') if re.match(r'[A-Za-z]:[\\/]|\\', path) else ''
+
+
+def shippable_text(obj: Any, *, project: str | Path | None) -> Any:
+    """``obj`` (JSON-shaped) as a record the SDK writes about a run may leave this machine.
+
+    The rule for texts the SDK writes (an error, a summary, a log line), always on. It knows the folders this machine
+    owns, its known roots: the home, the project, the working folder, the temporary folder and the prefixes and
+    ``site-packages`` folders of the running interpreter, each as written and resolved. It finds a spelling of one in a
+    text (the root as a path, as ``~``, ``~<user>``, ``$HOME`` or ``${HOME}``, as a ``file:`` URL, with a drive and either
+    separator on Windows, JSON-escaped, ``\\u002f``-escaped or percent-encoded) and replaces the path from there to its
+    end:
+
+    * a path under ``project`` is written relative to it (``project`` itself: ``.``; ``None``: no project). A project
+      that is the home folder or holds it (``/Users``, ``/home``, ``/``) is no project, the home is still a root, and a
+      project-relative result with a segment that is the user name is the stand-in;
+    * a path under any other known root is
+      :data:`~plurai.orchestrator.local_paths.LOCAL_PATH_MARKER`, and a ``:line`` suffix after it stays. A path
+      ends at the first whitespace or shell punctuation, or at the closing quote when a quote opened before it on the same
+      line (``File "/home/jane/My Project/a.py"``). Residual, accepted: an unquoted path with a space ships the words after
+      the space (``/home/jane/My Project/a.py`` becomes ``<stand-in> Project/a.py``); the root and the part before the first
+      space never ship. A path in a ``site-packages`` folder of this interpreter is the stand-in followed by the part after that folder
+      (``<stand-in>langgraph/pregel/main.py``) when that part is a plain package path (no empty, ``.`` or ``..``
+      segment, no space, no outage word, no user name);
+    * every other byte of a text ships as it was. That includes any path that is under no known root (``/opt/data/x.csv``,
+      another user's home), URLs and routes (``/api/orders/42``), template advice (``<out>/<scenario>/transcript.json``)
+      and relative paths. Residual, accepted: such a path names a place of this machine and is sent as written; the rule
+      does not guess from the shape of a text what is a path;
+    * a spelling of a root is exact, not guessed: a drive letter, a rooted backslash and mixed or doubled separators
+      read as one (``\\Users\\jane``, ``C:/Users/jane``), case is ignored where the file system ignores it, the last two
+      folders of the home with nothing before them (``home/jane/x``) are the home. A relative path (``../x``, ``x/y``) is
+      never read from the working folder and ships as written;
+    * the ``user:password@`` of any ``scheme://`` URL, read in the text as written (an encoded ``%2F`` or ``%40`` is part of
+      it), is replaced by ``[plurai: credentials not sent]@``; the host and the rest are kept. The userinfo is everything
+      after ``://`` up to the last ``@`` before the first ``/``, ``?``, ``#``, whitespace or quote, so a URL, a comma and an
+      address (``https://api.example.com:443,admin@corp.example``) also read as userinfo: accepted, to stay closed for
+      credentials. This is a rule about credentials, not about paths;
+    * a root is found anywhere in a text, a URL, a query or after a placeholder included. A root of one folder (``/root``,
+      ``/app``) is found only where it does not follow a word character, ``.``, ``~`` or ``-``, because it is also a
+      segment of a relative path or a URL (``src/root/main.py``, ``https://pypi.org/simple/root/``). A root of two folders
+      or more (``/home/jane``) is found wherever it appears, as the tail of a longer path or in a URL path included: the
+      asymmetry is deliberate.
+
+    The roots are read once, when the rule is built (a few path resolutions); matching a text reads no file. A decoded copy
+    of a text is read only to find a root, and the replacement is made in the text as written. Applying the rule twice gives
+    the same text. Dict keys are rewritten like values; two keys that ship as one text are numbered (``<key> #2``), so no
+    value is lost. Nothing raises: a text the rule cannot read ships as the stand-in. :meth:`HostReadScope.scrub` stays
+    for what the agent reads and for the opt-in anonymisation.
+    """
+    return _Shippable(project).walk(obj)
+
+
+def shippable_roots(roots: Sequence[str], *, project: str | Path | None) -> list[str]:
+    """The source roots a scan names, as a record the SDK writes about a run may leave this machine.
+
+    The roots are read as whole values, not as free text, with the project rule of :func:`shippable_text`: a root
+    under ``project`` is written relative to it (``.`` for the project itself), and every other absolute, ``~``-led,
+    ``$HOME``-led, Windows or ``file:`` root is :data:`~plurai.orchestrator.local_paths.LOCAL_PATH_MARKER`. With no
+    project, or a project that is the home folder or holds it, every such root is the stand-in. A relative root is
+    written as given unless a segment of it is the user name. Applying the rule twice gives the same list, so a roots
+    list that is already shipped comes back unchanged.
+    """
+    shipper = _Shippable(project)
+
+    def shipped(root: str) -> str:
+        if root.lower().startswith('file:'):
+            return LOCAL_PATH_MARKER
+        if _windows_form(root):
+            return shipper.windows(root)
+        if _is_local_root(root):
+            return shipper.stand_in(os.path.normpath(shipper.scope._expand(root)))  # noqa: SLF001
+        return LOCAL_PATH_MARKER if shipper.names_the_user(root) else root
+
+    return [shipped(root) for root in roots]
+
+
+def _is_local_root(root: str) -> bool:
+    return root.startswith(('/', '~', '$HOME', '${HOME}')) or bool(_windows_form(root))
+
+
+#: Where a scan contract records the roots its citations were resolved against.
+_CONTRACT_ROOTS_PATH = ('report', 'sections', 'fact_citations', 'roots')
+
+#: Where a scan contract records the render surface it found (``{"verbs": [...], "source": <config path>}``).
+_CONTRACT_RENDER_ACTIONS_PATH = ('render_actions',)
+
+#: The members of the render surface that name the scanning machine: the config file the verbs were read from and the
+#: reason a declaration could not be read. The verbs are the agent's own vocabulary (``/refund`` is a verb, not a path)
+#: and the service compares them by name, so they and every other member ship as written.
+_RENDER_ACTIONS_LOCAL_MEMBERS = ('source', 'unreadable')
+
+
+def _contract_member(contract: Any, path: tuple[str, ...]) -> Any:
+    node = contract
+    for key in path:
+        node = node.get(key) if isinstance(node, dict) else None
+    return node
+
+
+def contract_roots(contract: Any) -> Any:
+    """The citation roots of ``contract``, a scan contract as a document, or ``None`` when it holds none at :data:`_CONTRACT_ROOTS_PATH`."""
+    return _contract_member(contract, _CONTRACT_ROOTS_PATH)
+
+
+def shippable_contract(contract: dict[str, Any], *, typed_from: Path | None = None) -> dict[str, Any]:
+    """A copy of ``contract``, a scan contract as a document, with the parts that name the scanning machine shipped.
+
+    The project is ``typed_from``, the folder the scan ran in, which is also where a relative root is read from.
+    Without it (a contract read back later, where that folder is not known) there is no project and a relative root is
+    kept as written. The citation roots go through :func:`shippable_roots`, and the render surface's config ``source``
+    (a path) and the reason it could not be read (a text) through :func:`shippable_roots` and :func:`shippable_text`,
+    both with that project. The verbs and every other member of the surface, and every other section, are the
+    contract's own; only the dicts on the way to the rewritten members are copied.
+    """
+    roots = contract_roots(contract)
+    shipped = dict(contract)
+    if isinstance(roots, list) and all(isinstance(root, str) for root in roots):
+        given = [_read_from(root, typed_from) for root in roots]
+        shipped = _with_member(shipped, _CONTRACT_ROOTS_PATH, shippable_roots(given, project=typed_from))
+    if isinstance(surface := shipped.get(_CONTRACT_RENDER_ACTIONS_PATH[0]), dict):
+        shipper = _Shippable(typed_from)
+        shipped[_CONTRACT_RENDER_ACTIONS_PATH[0]] = {
+            **surface,
+            **{k: _render_member(k, surface[k], typed_from, shipper) for k in _RENDER_ACTIONS_LOCAL_MEMBERS if k in surface},
+        }
+    return shipped
+
+
+def _render_member(key: str, value: Any, project: Path | None, shipper: _Shippable) -> Any:
+    """The render surface's ``source`` is a path, read as a whole value like a root; ``unreadable`` is a text."""
+    if key == 'source' and isinstance(value, str):
+        return shippable_roots([value], project=project)[0]
+    return shipper.walk(value)
+
+
+def _read_from(root: str, folder: Path | None) -> str:
+    """``root`` as a path read from ``folder`` when it is relative; a local, Windows or ``file:`` root is kept as it is."""
+    if folder is None or _is_local_root(root) or root.lower().startswith('file:'):
+        return root
+    return str(folder / root)
+
+
+def _with_member(contract: dict[str, Any], path: tuple[str, ...], value: Any) -> dict[str, Any]:
+    """A copy of ``contract`` with the member at ``path`` replaced by ``value``; only the dicts on the way to it are copied."""
+    key, *rest = path
+    return {**contract, key: _with_member(contract[key], tuple(rest), value) if rest else value}
+
+
+def shippable_contract_roots(text: str) -> str:
+    """``text``, a scan contract as the scan wrote it, with :func:`shippable_contract` applied to its bytes.
+
+    Only the bytes of the citation roots and of the render surface change: the document is not re-serialised, so
+    every other section is the file's own, a leading byte order mark included. A JSON value that holds neither is
+    returned as it came. Raises :class:`ValueError` for a text that is not JSON: the rule cannot read it, so it must
+    not be sent as it is.
+    """
+    bom = '\ufeff' if text.startswith('\ufeff') else ''
+    body = text[len(bom) :]
+    document = json.loads(body)  # ValueError (JSONDecodeError) for a text that is not JSON
+    if not isinstance(document, dict):
+        return text
+    shipped = shippable_contract(document)
+    spans: list[tuple[int, int, Any]] = []
+    for path in (_CONTRACT_ROOTS_PATH, _CONTRACT_RENDER_ACTIONS_PATH):
+        before, after = _contract_member(document, path), _contract_member(shipped, path)
+        if before == after:
+            continue
+        span = (0, len(body))
+        for key in path:
+            found = _member_span(body, span[0], key)
+            if found is None:
+                raise ValueError(f'the scan contract member {".".join(path)} could not be located in the text')
+            span = found
+        spans.append((*span, after))
+    for start, end, value in sorted(spans, reverse=True):
+        body = body[:start] + json.dumps(value, ensure_ascii=False) + body[end:]
+    return bom + body
+
+
+def _member_span(text: str, start: int, key: str) -> tuple[int, int] | None:
+    """The ``(start, end)`` of the value of ``key`` in the JSON object that opens at ``text[start]``; the last one when repeated."""
+    decoder = json.JSONDecoder()
+
+    def skip(at: int) -> int:
+        while text[at] in ' \t\r\n':
+            at += 1
+        return at
+
+    found: tuple[int, int] | None = None
+    at = skip(text.index('{', start) + 1)
+    while text[at] != '}':
+        name, at = decoder.raw_decode(text, at)
+        at = skip(skip(at) + 1)  # past the colon
+        _, end = decoder.raw_decode(text, at)
+        if name == key:
+            found = (at, end)
+        at = skip(end)
+        if text[at] == ',':
+            at = skip(at + 1)
+    return found
+
+
+def harness_project(simulate_path: str | Path) -> Path:
+    """The root above the harness folder (``<project>/plurai_sim/simulate.py``): the project a text about a run writes its paths relative to."""
+    return Path(os.path.normpath(Path(simulate_path).absolute())).parent.parent
+
+
+def shipped_error[E: BaseException](make: Callable[[str], E], message: str, *, project: str | Path | None) -> E:
+    """The exception ``make(message)`` builds, with ``message`` as :func:`shippable_text` writes it.
+
+    The exception is what the failed-thread request, ``error.json`` and the transcript's failure metadata read, so
+    they all hold the one shipped text. The operator's terminal reads :func:`local_text_of`, which keeps what
+    ``make`` renders from ``message`` as written.
+    """
+    shipped_message = shippable_text(message, project=project)
+    if shipped_message == message:
+        return make(message)
+    shipped = make(shipped_message)
+    local = make(message)
+    if str(shipped) != str(local):
+        set_local_text(shipped, str(local) or repr(local))
+    return shipped
+
+
+def set_local_text(exc: BaseException, text: str) -> None:
+    """Record on ``exc`` the text :func:`local_text_of` returns, for an exception whose own text is the shipped one."""
+    exc.local_text = text  # type: ignore[attr-defined]
+
+
+def shippable_error_record(record: dict[str, Any], *, project: str | Path | None = None) -> dict[str, Any]:
+    """``record``, a scenario's ``error.json``, with every text through :func:`shippable_text` (the input is not changed).
+
+    The re-drive's ``original_error`` ends with the ``cause`` when it did before: the backend tells a persistent runtime
+    fault from a one-off by that suffix, and the two texts are rewritten apart, so the shipped cause is joined back.
+    """
+    shipped = shippable_text(record, project=project)
+    redrive, cause = record.get('redrive'), record.get('cause')
+    original = redrive.get('original_error') if isinstance(redrive, dict) else None
+    if isinstance(cause, str) and isinstance(original, str) and original.endswith(cause):
+        head = shippable_text(original.removesuffix(cause), project=project)
+        shipped['redrive'] = {**shipped['redrive'], 'original_error': head + shipped['cause']}
+    return shipped
+
+
+def local_text_of(exc: BaseException) -> str:
+    """What the operator's terminal prints for ``exc``: the text as written when :func:`shipped_error` rewrote it."""
+    return getattr(exc, 'local_text', None) or str(exc) or repr(exc)
 
 
 def _repo_entries(repo: Path, harness: str, *, root: str) -> list[Path]:

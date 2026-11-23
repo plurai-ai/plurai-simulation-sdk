@@ -99,7 +99,9 @@ from plurai._mocking.resolution import (
     unanswered_call_remedy,
 )
 from plurai._protocol import (
+    RESULT_EXPIRED_TEXT,
     TRAIL_NOT_DISPATCHABLE_STATUSES,
+    FinalizeResultExpired,
     HarnessIpcOverrun,
     MockMode,
     MockRuntimeFaultRaised,
@@ -161,18 +163,21 @@ from plurai.host_effects import (
     WRITE_LANDINGS,
     cli_own_write_landed,
     declared_host_requirements,
+    harness_project,
     host_read_scope,
+    local_text_of,
     observed_writes,
     redact_cli_credentials,
     redact_value,
     redacted_process_output,
     register_backend_token,
-    scrub_parent_record,
+    shippable_error_record,
+    shippable_text,
     trail_recorded,
 )
 from plurai.host_toolchain import PROBE_TIMEOUT_SECONDS as HOST_PROBE_TIMEOUT_SECONDS
 from plurai.host_toolchain import host_findings, host_stamp, install_block
-from plurai.identity import sdk_identity
+from plurai.identity import recorded_sdk_identity, sdk_identity
 from plurai.ingest.workspace_config import CONFIG_FILENAME, WorkspaceConfigError, discover_config_documents
 from plurai.user_surfaces import UserSurfacesConfigError, discover_surface_types
 from plurai.observability import create_observability_sink
@@ -459,7 +464,7 @@ def _preflight_egress(cfg: _RunConfig, settings: Settings, *, keep_guard_log: bo
             # guarded nor measured. An empty declaration has nothing to guard or measure, so it holds nothing.
             gates.emit(_unguarded_unmeasured(exc, phase='probe'))
         return
-    _record_egress(cfg.out, preflight.as_record(), repo=_bench_repo(cfg))
+    _record_egress(cfg.out, preflight.as_record(), repo=harness_project(cfg.agent_module_path))
     for finding in preflight.findings(harness_suffix=harness_suffix, mock_mode=mock_mode):
         gates.emit(finding)
     for line in preflight.report_lines():
@@ -475,7 +480,7 @@ def _egress_crashed(cfg: _RunConfig, gates: Any, exc: Exception, *, phase: str, 
     """
     detail = f'the preflight raised: {type(exc).__name__}: {exc}'
     record = {'status': 'unprovable', 'probe_mode': cfg.egress_probe, 'detail': detail, **({'enforcement': enforcement} if enforcement else {})}
-    _record_egress(cfg.out, record, repo=_bench_repo(cfg))
+    _record_egress(cfg.out, record, repo=harness_project(cfg.agent_module_path))
     print(f'[egress] WARNING: the egress preflight could not run ({type(exc).__name__}: {exc}); isolation is not established.', file=sys.stderr)
     gates.emit(
         make_finding(
@@ -543,7 +548,7 @@ def _guard_withdrawal(cfg: _RunConfig, gates: Any, allowed: tuple[str, ...], *, 
                     _egress_crashed(cfg, gates, exc, phase='guard_withdrawal', enforcement='none')
                     findings = (_unguarded_unmeasured(exc, phase='guard_withdrawal'),)
                 else:
-                    _record_egress(cfg.out, {**preflight.as_record(), 'warnings': [*preflight.warnings, why]}, repo=_bench_repo(cfg))
+                    _record_egress(cfg.out, {**preflight.as_record(), 'warnings': [*preflight.warnings, why]}, repo=harness_project(cfg.agent_module_path))
                     print(f'[egress] WARNING: {why}.', file=sys.stderr)
                     for line in preflight.report_lines():
                         print(line, file=sys.stderr)
@@ -589,8 +594,13 @@ def _uncovered_spawns(rows: list[dict[str, Any]]) -> set[str]:
     return uncovered | {f'{r.get("command")} ({r.get("cannot_arm")})' for r in rows if r.get('python') and r.get('cannot_arm')}
 
 
-def _egress_summary(out: Path) -> dict[str, Any]:
-    """``run_summary.egress``: the preflight's verdict plus, when the guard was armed, what it saw at run time."""
+def _egress_summary(out: Path, *, project: Path | None = None) -> dict[str, Any]:
+    """``run_summary.egress``: the preflight's verdict plus, when the guard was armed, what it saw at run time.
+
+    The guard's rows name a call site as the child saw it (an absolute file and its line), so the runtime block is
+    written as it may leave the machine (:func:`~plurai.host_effects.shippable_text`): a file under ``project``
+    relative to it, any other local path the stand-in (``None``: every local path).
+    """
     summary = dict(_LAST_EGRESS_RECORD)
     if not summary or not (spec := os.environ.get(GUARD_ENV)):
         return summary
@@ -609,7 +619,7 @@ def _egress_summary(out: Path) -> dict[str, Any]:
         summary['runtime'] = {'not_covered': 'non-Python harness', **_payload_codec_notes(by_kind)}
         return summary
     if unreadable is not None:
-        summary['runtime'] = {'error': f'{EGRESS_OBSERVED_FILENAME} unreadable: {type(unreadable).__name__}: {unreadable}'}
+        summary['runtime'] = shippable_text({'error': f'{EGRESS_OBSERVED_FILENAME} unreadable: {type(unreadable).__name__}: {unreadable}'}, project=project)
         return summary
 
     def _distinct(kind: str, key: str) -> list[dict[str, Any]]:
@@ -660,7 +670,7 @@ def _egress_summary(out: Path) -> dict[str, Any]:
             'host reached from them was neither probed nor blocked. If the agent runs there, declare `egress.agent_runtime: subprocess`.'
         )
     runtime.update(_payload_codec_notes(by_kind))
-    summary['runtime'] = runtime
+    summary['runtime'] = shippable_text(runtime, project=project)
     return summary
 
 
@@ -685,14 +695,14 @@ def _payload_codec_notes(by_kind: dict[str, list[dict[str, Any]]]) -> dict[str, 
     return notes
 
 
-def _report_egress_runtime(out: Path) -> None:
+def _report_egress_runtime(out: Path, *, project: Path) -> None:
     """What the in-process guard did during the run, as gate findings — once, after the run.
 
     Each distinct blocked host is ``egress.guard_blocked`` (SECURITY: the refusal is the isolation, so an
     overrule naming it is refused and the deny list never reads one), and a ``guarded`` verdict the run
     could not fully back is ``egress.guard_coverage_gap``. Read off the same guard log the summary folds.
     """
-    runtime = _egress_summary(out).get('runtime')
+    runtime = _egress_summary(out, project=project).get('runtime')
     if not isinstance(runtime, dict):
         return
     gates = current_gate_authority()
@@ -720,11 +730,6 @@ def _report_egress_runtime(out: Path) -> None:
         )
 
 
-def _bench_repo(cfg: Any) -> Path:
-    """The root above the harness — the rung :func:`plurai.host_effects.scrub_parent_record` reads as allowed."""
-    return Path(os.path.normpath(Path(cfg.agent_module_path).absolute())).parent.parent
-
-
 def _record_egress(out: Path, record: dict[str, Any], *, repo: Path) -> None:
     """File the egress verdict in BOTH channels: its own artifact and the module handoff that
     puts a summary of it into ``run_summary.json``.
@@ -733,10 +738,10 @@ def _record_egress(out: Path, record: dict[str, Any], *, repo: Path) -> None:
     is REFUSED and no verdict exists; the summary key is what every existing consumer of a
     finished run already reads. A verdict in only the first is a verdict nothing consults.
 
-    Both carry the record as it may leave the machine: its paths (the scan root, the config, the
-    sources a host was found in) from ``~`` and never naming the operator.
+    Both carry the record as it may leave the machine (:func:`~plurai.host_effects.shippable_text`): its paths (the
+    scan root, the config, the sources a host was found in) relative to ``repo``, any other local path the stand-in.
     """
-    record = scrub_parent_record(record, repo=repo)
+    record = shippable_text(record, project=repo)
     _LAST_EGRESS_RECORD.clear()
     _LAST_EGRESS_DECLARED.clear()
     _LAST_EGRESS_DECLARED.update(str(h.get('host')) for h in (record.get('declared') or ()) if isinstance(h, dict) and h.get('host'))
@@ -821,7 +826,11 @@ def _preflight_scan_contract(cfg: _RunConfig) -> GateFinding | None:
     if cfg.scan_contract is None:
         # Said out loud, once, exactly as `not_declared` is: a check that silently reports
         # nothing reads exactly like a check that found nothing.
-        _record_scan_drift(cfg.out, {'checked': False, 'summary': 'corpus source drift NOT checked: no --scan-contract baseline was passed to this run'})
+        _record_scan_drift(
+            cfg.out,
+            {'checked': False, 'summary': 'corpus source drift NOT checked: no --scan-contract baseline was passed to this run'},
+            project=harness_project(cfg.agent_module_path),
+        )
         print(
             "[scan-contract] NOT CHECKED: no --scan-contract baseline was passed, so nothing verified that this suite's "
             'corpus is still the corpus on this machine. Run `plurai-scan-contract check` and pass its scan_contract.json.',
@@ -830,7 +839,7 @@ def _preflight_scan_contract(cfg: _RunConfig) -> GateFinding | None:
         return None
     outcome_record = _scan_drift_outcome(cfg, cfg.scan_contract)
     message = str(outcome_record['summary'])
-    _record_scan_drift(cfg.out, outcome_record)
+    _record_scan_drift(cfg.out, outcome_record, project=harness_project(cfg.agent_module_path))
     # THREE labels for three states, spelled out rather than nested: ``checked`` and ``matched``
     # are separate facts (a comparison that never happened has no verdict to report), and the
     # NOT-CHECKED rung must not be reachable by falling off the end of a MATCH/DRIFT pair.
@@ -953,13 +962,17 @@ def _scan_drift_outcome(cfg: _RunConfig, baseline_path: Path) -> dict[str, Any]:
     return {**outcome.as_record(), 'roots': roots}
 
 
-def _record_scan_drift(out: Path, record: dict[str, Any]) -> None:
+def _record_scan_drift(out: Path, record: dict[str, Any], *, project: Path) -> None:
     """File the drift verdict in BOTH channels — its own artifact and the run-summary handoff.
 
     The same two-channel shape :func:`_record_egress` uses, and for the same reason: the file is
     written even when the run is refused and no verdict exists, and the summary key is what every
     existing consumer of a finished run already reads.
+
+    Both carry the record as it may leave the machine (:func:`~plurai.host_effects.shippable_text`): the scan roots
+    in the summary and in ``roots`` are relative to ``project`` when under it, else the stand-in.
     """
+    record = shippable_text(record, project=project)
     _LAST_SCAN_DRIFT_RECORD.clear()
     _LAST_SCAN_DRIFT_RECORD.update({k: record[k] for k in ('checked', 'summary') if k in record})
     if isinstance(record.get('drift'), dict):
@@ -1876,10 +1889,16 @@ async def _bookkeep(request: Callable[[], Awaitable[object]], *, what: str, thre
         logger.debug('%s bookkeeping failed for thread %s', what, thread_id, exc_info=True)
 
 
-async def _close_thread(orch: Orchestrator, thread_id: str | None, *, exception: str, error: str) -> None:
+async def _close_thread(orch: Orchestrator, thread_id: str | None, *, exception: str, error: str, fail_thread: bool = True) -> None:
     """One best-effort ``/fail`` (:func:`_bookkeep`) of *thread_id*, then the cancel of any finalize job the attempt
-    submitted; the ``/fail`` only when the attempt holds a thread."""
-    if thread_id:
+    submitted; the ``/fail`` only when the attempt holds a thread and *fail_thread* is set. A thread the server already
+    finished is not failed: ``/fail`` would state something false about it.
+
+    *error* leaves the machine in the request body, so this is a last pass of the strict rule, with no project: a text
+    the raise sites already wrote holds no absolute path and is unchanged (the rule is idempotent), and any other local
+    path is the stand-in."""
+    if thread_id and fail_thread:
+        error = shippable_text(error, project=None)
         await _bookkeep(lambda: orch.client.fail(thread_id, exception=exception, error=error), what='/fail', thread_id=thread_id)
     await _bookkeep(orch._cancel_inflight_finalize, what='finalize cancel', thread_id=thread_id)
 
@@ -4608,8 +4627,10 @@ def _preflight_host_toolchain(cfg: _RunConfig) -> None:
         why = f"the resolver could not run in the agent's interpreter ({type(exc).__name__}: {exc}{'; ' + stderr_tail if stderr_tail else ''})"
         names = [(r.name, r.kind) for r in declared] if declared else [('host_requirements', 'declaration')]
         toolchain = {'confinement': None, 'requirements': [{'name': n, 'kind': k, 'status': 'not_checked', 'detail': why} for n, k in names]}
-    # the record carries the measurement; the install block (it names a local folder) is printed, never recorded
-    _LAST_HOST_TOOLCHAIN_RECORD.update({**{k: v for k, v in toolchain.items() if k != 'install'}, 'stamp': host_stamp(toolchain) or None})
+    # the record carries the measurement as it may leave the machine (a resolver that could not run names its own command line
+    # in the detail); the install block (it names a local folder) is printed, never recorded
+    toolchain = shippable_text({k: v for k, v in toolchain.items() if k != 'install'}, project=workdir.parent)
+    _LAST_HOST_TOOLCHAIN_RECORD.update({**toolchain, 'stamp': host_stamp(toolchain) or None})
     gates = current_gate_authority()
     for finding in host_findings(toolchain, declared or ()):
         gates.emit(finding)
@@ -4846,7 +4867,7 @@ def _write_run_summary(
                 # WHICH SDK ran this, and WHICH BACKEND scored it. Written always, ``null``
                 # included for the backend, so "did two runs use the same binary against the
                 # same backend?" is answerable from the artifacts rather than by inference.
-                'sdk_identity': sdk_identity(),
+                'sdk_identity': recorded_sdk_identity(),
                 'backend_build': _aggregate_backend_build(),
                 # WHICH rows the backend scored over a world it does not certify, and WHY — its
                 # own typed map, because ``finalize.status`` says only whether a decisive policy
@@ -4862,7 +4883,7 @@ def _write_run_summary(
                 # row never reads confined by omission); the disclosure is read afresh over the merged rows, overlaid.
                 'host_effects': {
                     **(_union_host_effects([verdict.prior_host_effects, _host_effects_summary()]) if verdict.prior_host_effects else _host_effects_summary()),
-                    **_home_disclosure(out, verdict.scenarios, repo=_bench_repo(cfg)),
+                    **_home_disclosure(out, verdict.scenarios, repo=harness_project(cfg.agent_module_path)),
                 },
                 'scored': verdict.scored,
                 'scored_this_invocation': verdict.scored_this_invocation,
@@ -4997,7 +5018,7 @@ def _write_run_summary(
                 # egress_preflight.json beside this file.
                 # A trial of a ``--trials N`` run reads the invocation's ONE guard log (``egress_dir``):
                 # every agent child of every trial inherits the same guard and writes there.
-                'egress': _egress_summary(egress_dir or out),
+                'egress': _egress_summary(egress_dir or out, project=harness_project(cfg.agent_module_path)),
                 # CORPUS DRIFT. Written always, empty included, on the same rule as
                 # ``egress`` above: "the sources still match", "they drifted" and "nobody asked"
                 # are three different runs, and an absent key makes the third read like the first.
@@ -5294,7 +5315,7 @@ def _invariant_exit(cfg: _RunConfig | None) -> int | None:
 def _relative_to_bench(path: Path, cfg: _RunConfig) -> str:
     """``path`` relative to the bench root, for stable finding evidence (an absolute path moves between machines)."""
     try:
-        return str(Path(path).resolve().relative_to(_bench_repo(cfg).resolve()))
+        return str(Path(path).resolve().relative_to(harness_project(cfg.agent_module_path).resolve()))
     except ValueError:
         return Path(path).name
 
@@ -5399,7 +5420,7 @@ def _run_context(
         'agent_version': cfg.agent_version,
         # WHICH SDK wrote this file, from the LOADED module. Not ``__version__``:
         # that is dist metadata, which a stale editable install leaves out of date.
-        'sdk_identity': sdk_identity(),
+        'sdk_identity': recorded_sdk_identity(),
         'scenario_set_id': cfg.scenario_set_id,
         'eval_set_id': cfg.eval_set_id,
         'run_name': run_name,
@@ -6405,6 +6426,7 @@ def _write_error(
             _write_json(scenario_out / ERROR_DIALOG_FILENAME, {'turns': list(turns_reached)})
         except OSError:
             logger.warning('could not write %s in %s; error.json still records turns_reached', ERROR_DIALOG_FILENAME, scenario_out, exc_info=True)
+    record = shippable_error_record(record)
     _write_json(scenario_out / 'error.json', record)
     try:
         verdicts.write_initial(
@@ -6515,6 +6537,9 @@ def _fail_line(scenario_id: str, record: dict[str, Any]) -> str:
         began = bool(record.get('turns_reached')) or record.get('thread_id') not in (None, '', 'unknown')
         outcome = 'completed' if began else 'run'
         return f'[NOT RUN] {scenario_id}: {BACKEND_REFUSED_PHRASE}; this scenario was not {outcome}'
+    if record.get('kind') == FinalizeResultExpired.kind:
+        # The conversation finished and was scored: the fixed text says so and nothing of the job or the thread.
+        return f'[FAIL] {scenario_id}: {RESULT_EXPIRED_TEXT}'
     if is_harness_owned(record.get('kind')):
         # Not every harness fault is a budget: a reaped child (harness_child_exited) is a
         # crash, and labelling it [TIMEOUT] would send an operator hunting a wall nothing hit.
@@ -8487,7 +8512,10 @@ async def _drive_one_scenario(
                 # Stop any in-flight async finalize job to avoid billing LLM judges after the SDK has already given up on
                 # this scenario. The transport's own text names a status, a URL or an id, so an outage's ``/fail`` carries
                 # :class:`BackendUnavailable` alone; a mock fault's words are the SDK's own and already say nothing of either.
-                await _close_thread(orch, thread_id, exception=type(exc).__name__, error=str(exc))
+                # An error that sets ``sends_fail`` false (a result that expired on a thread the server finished) skips the ``/fail``.
+                await _close_thread(
+                    orch, thread_id, exception=type(exc).__name__, error=str(exc), fail_thread=not isinstance(exc, OrchestratorAdapterError) or exc.sends_fail
+                )
                 # A ceiling re-run that FAILED gives back the attempt it was trying to improve
                 # on: that attempt is a real measurement, already graded, and reporting this row
                 # as a failure would delete it from graded_scenarios, ended_early_scenarios and
@@ -8519,7 +8547,8 @@ async def _drive_one_scenario(
                     ),
                 )
                 _write_partial_evidence(scenario_out, scenario=scenario_id, progress=progress)
-                print(f'[{_ts()}] {_fail_line(_row_label(cfg, scenario_id), record)}', file=sys.stderr)
+                # The operator's terminal reads the message as the harness wrote it; the record and the ``/fail`` body hold it shipped.
+                print(f'[{_ts()}] {_fail_line(_row_label(cfg, scenario_id), {**record, "error": local_text_of(exc)})}', file=sys.stderr)
                 return None
             finally:
                 watch_admission.cancel()
@@ -10881,7 +10910,7 @@ def _publish_trials(cfg: _RunConfig, *, run_name: str, scenario_ids: Sequence[st
         {
             'run_name': run_name,
             'exit_code': exit_code,
-            'egress': _egress_summary(cfg.out),
+            'egress': _egress_summary(cfg.out, project=harness_project(cfg.agent_module_path)),
             'host_effects': _union_host_effects(s.get('host_effects') for s in summaries if s is not None),
             # Trial 1's own block, kept beside the union: the prior a later --scenario-id re-run of trial 1 merges.
             TRIAL_1_HOST_EFFECTS: top.get('host_effects') or {},
@@ -12956,7 +12985,7 @@ def _main_body(args: argparse.Namespace) -> int:
     # the trials run one after another, each still C wide. No limit known (macOS, no cgroup) → unchanged.
     cfg = _trials_in_turn_for_memory(cfg, _memory_limit_mb())
     code = _run_as_experiment(cfg, settings, sink) if isinstance(sink, ExperimentRunnerSink) else asyncio.run(_run_gathered_async(cfg, settings, sink))
-    _report_egress_runtime(cfg.out)
+    _report_egress_runtime(cfg.out, project=harness_project(cfg.agent_module_path))
     return code
 
 

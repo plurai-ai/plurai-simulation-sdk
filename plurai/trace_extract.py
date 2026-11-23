@@ -17,13 +17,16 @@ credentials) are. The sink client is built with the api_key passed straight in
 
 The wire artifacts written under ``out_dir`` are:
 
-* ``traces/<trace_id>.json`` — one file per trace, holding that trace's WHOLE
-  activity tree: for LangSmith a JSON list of run dicts (the run tree); for
-  Langfuse the trace object with its full ``observations`` tree embedded (a flat
-  list with ``parent_observation_id`` edges). The directory is the input the
-  backend's agent-authored loader enumerates over 100%. A LangSmith export by
-  ``thread_ids`` writes ``traces/<thread_id>.json`` instead: one file per
-  conversation, holding every root of the thread with its run tree.
+* ``traces/<conversation_id>.json`` — by default one file per conversation (a
+  LangSmith thread, a Langfuse session), holding every trace of it oldest first
+  with each trace's WHOLE activity tree: for LangSmith a JSON list of run dicts
+  (the run trees of the thread's roots); for Langfuse a JSON array of trace
+  objects, each with its full ``observations`` tree embedded (a flat list with
+  ``parent_observation_id`` edges). A trace that names no conversation is a
+  conversation of one, written as ``traces/<trace_id>.json`` in the same shape.
+  ``source_config["group"] = "trace"`` writes one ``traces/<trace_id>.json`` per
+  trace instead (for Langfuse the bare trace object). The directory is the input
+  the backend's agent-authored loader enumerates over 100%.
 * ``manifest.json``          — source kind, project, trace count, and how the sink
   was narrowed (NO credentials).
 
@@ -56,7 +59,7 @@ import json
 import logging
 import re
 import shutil
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -89,6 +92,15 @@ _SECRET_KEYS = frozenset({'api_key', 'token', 'password', 'secret', 'secret_key'
 
 class TraceExtractionDependencyError(ImportError):
     """Raised when a sink's client library (e.g. ``langsmith``) isn't installed."""
+
+
+# ``source_config["group"]``: how a live export groups the sink's traces into files. ``conversation``
+# (the default) writes one file per conversation and ``--limit`` counts conversations; ``trace``
+# writes one file per trace and ``--limit`` counts traces.
+_GROUPS = ('conversation', 'trace')
+
+# The run-metadata keys LangSmith derives a root's thread id from, in its own order.
+_LANGSMITH_THREAD_KEYS = ('thread_id', 'session_id', 'conversation_id')
 
 
 class TraceExportError(ValueError):
@@ -295,17 +307,149 @@ def _write_json(path: Path, payload: list[dict[str, Any]]) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, default=str))
 
 
+def _group(source_config: dict[str, Any], source: str) -> str:
+    """The export's ``group``: ``conversation`` unless the source config says ``trace``."""
+    group = source_config.get('group')
+    if group is None:
+        return 'conversation'
+    if group not in _GROUPS:
+        raise TraceExportError(
+            f'{source} source_config["group"] must be "conversation" (one file per conversation, the default) or "trace" (one file per trace).'
+        )
+    return cast('str', group)
+
+
+def _recent_conversations[R](
+    roots: Iterable[R], limit: int | None, *, conversation_of: Callable[[R], str | None], trace_of: Callable[[R], str]
+) -> list[tuple[str | None, R]]:
+    """The newest ``limit`` conversations (all if None) among ``roots`` listed newest first.
+
+    Each is ``(conversation id, the newest root seen of it)``; a root naming no conversation is a
+    conversation of one, with id None. ``roots`` is read no further than the last conversation
+    needed, so a paged listing fetches no page beyond it.
+    """
+    found: dict[tuple[bool, str], tuple[str | None, R]] = {}
+    for root in roots:
+        conversation = conversation_of(root)
+        found.setdefault((True, conversation) if conversation else (False, trace_of(root)), (conversation, root))
+        if limit is not None and len(found) >= limit:
+            break
+    return list(found.values())
+
+
+@dataclass
+class _ConversationFiles:
+    """The files of an export by conversation: one per conversation, a sessionless trace its own.
+
+    ``thread_files`` maps every file (a sessionless trace's under its trace id), so a re-read of the
+    export through ``export_dir`` and the anonymized rename both see all of them.
+    """
+
+    traces_dir: Path
+    thread_files: dict[str, str] = field(default_factory=dict)
+    sessionless: int = 0
+    roots: int = 0
+    # Conversations whose own read came back empty, so their file holds only the root that listed them.
+    single_root: list[str] = field(default_factory=list)
+    # Every file name written, case-folded: a case-insensitive disk keeps one of two names that differ only in case.
+    _taken: set[str] = field(default_factory=set, init=False, repr=False)
+
+    def roots_of[R](self, conversation_id: str | None, newest: R, read: Callable[[str], list[R]]) -> list[R]:
+        """The roots one file holds: every root ``read`` returns for the conversation, ``newest`` alone for a root naming none.
+
+        A conversation whose own read returns nothing (the sink derives its key differently, or has
+        not indexed it yet) falls back to ``newest``, the root that listed it. That file may be
+        missing turns, so the conversation is listed in ``selection.single_root_conversations``
+        and counted in a warning rather than passed off as whole.
+        """
+        if conversation_id is None:
+            return [newest]
+        roots = read(conversation_id)
+        if roots:
+            return roots
+        self.single_root.append(conversation_id)
+        return [newest]
+
+    def write(self, conversation_id: str | None, trace_id: str, payload: list[dict[str, Any]], roots: int) -> None:
+        key, name = (conversation_id, _thread_file(conversation_id)) if conversation_id else (trace_id, _trace_file(trace_id))
+        folded = name.casefold()
+        if key in self.thread_files or folded in self._taken:
+            raise TraceExportError(
+                'two conversations of this export map to one trace file name (ids that differ only in case, or a conversation id '
+                'equal to the id of a trace that names no conversation); re-run with source_config "group": "trace" to write one file per trace.'
+            )
+        self._taken.add(folded)
+        self.thread_files[key] = name
+        self.sessionless += conversation_id is None
+        self.roots += roots
+        _write_json(self.traces_dir / name, payload)
+
+    def selection(self) -> dict[str, Any]:
+        """The export's ``selection`` keys; called once, when every file is written."""
+        if self.single_root:
+            # A count, not the ids: a conversation id is often a phone number or an email. The ids
+            # are in the export's local ``selection.single_root_conversations``.
+            logger.warning(
+                '%d conversation(s) returned no traces when read by id; each file holds only the trace that listed it and may be missing turns',
+                len(self.single_root),
+            )
+        # ``conversation_count`` counts every file (a sessionless trace is a conversation of one);
+        # ``sessionless_trace_count`` says how many of them are.
+        return {
+            'unit': 'conversation',
+            'conversation_count': len(self.thread_files),
+            'sessionless_trace_count': self.sessionless,
+            'root_count': self.roots,
+            'single_root_conversations': self.single_root,
+            'thread_files': self.thread_files,
+        }
+
+
+def _langsmith_thread(root: Run) -> str | None:
+    """The thread id LangSmith derives for a root from its run metadata, or None when it names none."""
+    extra = getattr(root, 'extra', None)
+    metadata = extra.get('metadata') if isinstance(extra, dict) else None
+    if not isinstance(metadata, dict):
+        return None
+    for key in _LANGSMITH_THREAD_KEYS:
+        value = metadata.get(key)
+        if value is not None and str(value).strip():
+            return str(value)
+    return None
+
+
+def _export_recent_threads(client: Client, project: str, traces_dir: Path, limit: int | None, filter_: str | None) -> dict[str, Any]:
+    """The newest ``limit`` threads among the roots matching ``filter_``, each exported whole.
+
+    The filter decides which threads qualify (a root of them matches); a qualifying thread is still
+    written with every root, because a conversation cut to its matching turns is not the
+    conversation. A root naming no thread is its own file, the same shape as a per-trace export.
+    """
+    with _naming_a_rejected_filter(filter_):
+        listing = client.list_runs(project_name=project, is_root=True, **({'filter': filter_} if filter_ else {}))
+        recent = _recent_conversations(listing, limit, conversation_of=_langsmith_thread, trace_of=_trace_id)
+    files = _ConversationFiles(traces_dir)
+    for thread_id, newest in recent:
+        roots = files.roots_of(thread_id, newest, lambda thread: _thread_roots(client, project, thread))
+        files.write(thread_id, _trace_id(newest), [run for root in roots for run in _tree_payload(client, project, root)], len(roots))
+    return files.selection()
+
+
 def _extract_langsmith(source_config: dict[str, Any], traces_dir: Path, limit: int | None) -> _Export:
     """Export a LangSmith project's traces as run-tree files under ``traces_dir``.
 
-    Two selection modes, both narrowable by ``source_config["filter"]`` (LangSmith's
+    Three selection modes, all narrowable by ``source_config["filter"]`` (LangSmith's
     run-filter grammar):
 
-    * **traces** (no ``thread_ids``): the newest roots matching the filter, one
-      ``<trace_id>.json`` per root. ``limit`` counts roots.
-    * **conversations** (``thread_ids``): one ``<thread_id>.json`` per listed thread
-      holding EVERY root of that thread with its tree — the shape ``convert-trace``
-      reads as one conversation. The filter decides which listed threads qualify (at
+    * **recent conversations** (the default: no ``thread_ids``, ``group`` unset or
+      ``conversation``): the newest threads among the roots matching the filter, one
+      ``<thread_id>.json`` per thread holding EVERY root of it with its tree; a root
+      naming no thread is its own ``<trace_id>.json``. ``limit`` counts conversations.
+    * **traces** (no ``thread_ids``, ``group`` = ``trace``): the newest roots matching
+      the filter, one ``<trace_id>.json`` per root. ``limit`` counts roots.
+    * **listed conversations** (``thread_ids``, refused beside ``group`` = ``trace``): one
+      ``<thread_id>.json`` per listed thread holding EVERY root of that thread with its tree —
+      the shape ``convert-trace`` reads as one conversation. The filter decides which listed threads qualify (at
       least one root matches); a qualifying thread is still exported whole, because a
       conversation cut to its matching turns is not the conversation. ``limit`` counts
       exported conversations, in the listed order.
@@ -324,6 +468,13 @@ def _extract_langsmith(source_config: dict[str, Any], traces_dir: Path, limit: i
     if not project:
         raise ValueError('langsmith trace export requires source_config["project"] (the project/session to export traces from).')
     filter_, thread_ids = _langsmith_selection(source_config)
+    group = _group(source_config, 'langsmith')
+    if thread_ids is not None and group == 'trace':
+        # Refused rather than one key silently winning: the operator asked for two different units.
+        raise TraceExportError(
+            'langsmith source_config "thread_ids" exports each listed thread whole, so it cannot be combined with "group": "trace". '
+            'Leave out "group" to export the listed threads, or leave out "thread_ids" to export one file per trace.'
+        )
 
     # api_key passed straight to the client — NO os.environ mutation (mirrors
     # langsmith.build_handle). An optional api_url overrides the endpoint.
@@ -333,8 +484,12 @@ def _extract_langsmith(source_config: dict[str, Any], traces_dir: Path, limit: i
         'filter': filter_,
         'thread_ids': thread_ids,
         'limit': limit,
-        'unit': 'conversation' if thread_ids else 'trace',
+        'unit': group,
     }
+
+    if thread_ids is None and group == 'conversation':
+        selection.update(_export_recent_threads(client, project, traces_dir, limit, filter_))
+        return _Export(len(selection['thread_files']), selection)
 
     if thread_ids is None:
         # Each root run is one trace; pull its full tree by trace_id so the backend
@@ -505,9 +660,11 @@ def _v2_paged(fetch: Callable[..., Any], **query: Any) -> Iterator[Any]:
             return
 
 
-def _root_filter(filters: dict[str, Any]) -> str:
-    """The v2 ``filter`` for trace roots, narrowed by the export's ``environment`` / ``name`` (the trace name)."""
+def _root_filter(filters: dict[str, Any], *, session_id: str | None = None) -> str:
+    """The v2 ``filter`` for trace roots, narrowed by the export's ``environment`` / ``name`` (the trace name) and, when given, one session."""
     conditions: list[dict[str, Any]] = [{'type': 'boolean', 'column': 'isRootObservation', 'operator': '=', 'value': True}]
+    if session_id is not None:
+        conditions.append({'type': 'string', 'column': 'sessionId', 'operator': '=', 'value': session_id})
     environment = filters.get('environment')
     if environment:
         values = list(environment) if isinstance(environment, (list, tuple)) else [environment]
@@ -658,9 +815,35 @@ def _trace_from_rows(root: ObservationV2, observations: list[dict[str, Any]], sc
     }
 
 
+def _session_roots(api: LangfuseAPI, session_id: str, filters: dict[str, Any]) -> list[ObservationV2]:
+    """Every root of one session the export's ``environment`` / ``name`` filters admit, one per trace, oldest first.
+
+    The filters stay on, so a session id another producer also reported under brings none of that
+    producer's traces into the file.
+    """
+    newest: dict[str, ObservationV2] = {}
+    query = {'filter': _root_filter(filters, session_id=session_id), 'fields': _LANGFUSE_V2_FIELDS, 'limit': _LANGFUSE_V2_MAX_PAGE}
+    for row in _v2_paged(api.observations.get_many, **query):
+        if row.trace_id:
+            newest.setdefault(str(row.trace_id), row)
+    return sorted(newest.values(), key=lambda row: (row.start_time, str(row.trace_id)))
+
+
+def _langfuse_session(root: Any) -> str | None:
+    """A Langfuse trace's session id, or None: v2 reports an unset session as an empty string."""
+    return str(root.session_id) if getattr(root, 'session_id', None) else None
+
+
 def _extract_langfuse(source_config: dict[str, Any], traces_dir: Path, limit: int | None) -> _Export:
-    """Export a Langfuse project's traces — one ``traces/<trace_id>.json`` per trace
-    (the trace plus its full observation tree).
+    """Export a Langfuse project's traces, grouped by ``source_config["group"]``.
+
+    * ``conversation`` (the default): the newest ``limit`` sessions, one
+      ``traces/<session_id>.json`` per session holding a JSON array of EVERY trace of the
+      session (each with its full observation tree) oldest first, including traces older than
+      the newest ones listed. A trace with no session is its own ``traces/<trace_id>.json``, an
+      array of one. ``limit`` counts conversations.
+    * ``trace``: one ``traces/<trace_id>.json`` per trace (the trace object with its full
+      observation tree). ``limit`` counts traces.
 
     Reads through Observations API v2, the only trace read Langfuse Cloud serves; a server
     without it (self-hosted Langfuse v3) is read through the v1 trace API. The manifest's
@@ -679,6 +862,7 @@ def _extract_langfuse(source_config: dict[str, Any], traces_dir: Path, limit: in
             'langfuse trace export requires source_config["public_key"] and source_config["secret_key"] '
             '(the per-project key pair — they stay local, never written to disk).'
         )
+    group = _group(source_config, 'langfuse')
 
     # Keys handed straight to the client — NO os.environ mutation (mirrors
     # observability/langfuse._build_client + the langsmith reader). An optional host
@@ -703,7 +887,7 @@ def _extract_langfuse(source_config: dict[str, Any], traces_dir: Path, limit: in
     # silently substituting other traces.
     filters = {'environment': source_config.get('environment'), 'name': source_config.get('name')}
 
-    roots = _iter_recent_roots(api, limit, filters=filters)
+    roots = _iter_recent_roots(api, limit if group == 'trace' else None, filters=filters)
     try:
         first = next(roots, None)
     except Exception as exc:
@@ -713,7 +897,7 @@ def _extract_langfuse(source_config: dict[str, Any], traces_dir: Path, limit: in
         # still serves the v1 trace API.
         logger.warning('langfuse: the server has no Observations API v2 (a self-hosted Langfuse v3); reading through the v1 trace API')
         try:
-            return _extract_langfuse_v1(api, traces_dir, limit, filters)
+            return _extract_langfuse_v1(api, traces_dir, limit, filters, group)
         except Exception as v1_exc:
             if getattr(v1_exc, 'status_code', None) != 404:
                 raise
@@ -721,31 +905,58 @@ def _extract_langfuse(source_config: dict[str, Any], traces_dir: Path, limit: in
                 'langfuse answered 404 for both Observations API v2 and the v1 trace API; check that "host" names the Langfuse server itself.'
             ) from exc
 
-    written = 0
     truncated: list[str] = []
     scores_unread: list[str] = []
-    for root in itertools.chain([first] if first is not None else [], roots):
-        trace_id = str(root.trace_id)
+
+    def trace(root: ObservationV2) -> dict[str, Any]:
         observations = _fetch_trace_rows(api, root, truncated=truncated)
-        trace = _trace_from_rows(root, observations, _trace_scores(api, trace_id, unread=scores_unread))
-        (traces_dir / _trace_file(trace_id)).write_text(json.dumps(trace, ensure_ascii=False, default=str))
-        written += 1
+        return _trace_from_rows(root, observations, _trace_scores(api, str(root.trace_id), unread=scores_unread))
+
+    listed = itertools.chain([first] if first is not None else [], roots)
     # Always stated, empty lists included: "no file is a root alone" is a fact about the corpus.
-    return _Export(written, {'read_api': 'v2', 'truncated_trace_ids': truncated, 'scores_unread_trace_ids': scores_unread})
+    selection: dict[str, Any] = {'read_api': 'v2', 'truncated_trace_ids': truncated, 'scores_unread_trace_ids': scores_unread}
+    if group == 'trace':
+        written = 0
+        for root in listed:
+            (traces_dir / _trace_file(str(root.trace_id))).write_text(json.dumps(trace(root), ensure_ascii=False, default=str))
+            written += 1
+        return _Export(written, {**selection, 'unit': 'trace'})
+
+    files = _ConversationFiles(traces_dir)
+    for session_id, newest in _recent_conversations(listed, limit, conversation_of=_langfuse_session, trace_of=lambda root: str(root.trace_id)):
+        session = files.roots_of(session_id, newest, lambda conversation: _session_roots(api, conversation, filters))
+        files.write(session_id, str(newest.trace_id), [trace(root) for root in session], len(session))
+    return _Export(len(files.thread_files), {**selection, 'limit': limit, **files.selection()})
 
 
-def _extract_langfuse_v1(api: LangfuseAPI, traces_dir: Path, limit: int | None, filters: dict[str, Any]) -> _Export:
-    """Export through the v1 trace API, for a server without Observations API v2."""
-    written = 0
+def _session_traces_v1(api: LangfuseAPI, session_id: str, filters: dict[str, Any]) -> list[TraceWithDetails]:
+    """Every trace of one session the export's filters admit, oldest first, through the v1 trace API."""
+    rows = {str(row.id): row for row in _iter_recent_traces(api, None, filters={**filters, 'session_id': session_id})}
+    return sorted(rows.values(), key=lambda row: (row.timestamp, str(row.id)))
+
+
+def _extract_langfuse_v1(api: LangfuseAPI, traces_dir: Path, limit: int | None, filters: dict[str, Any], group: str) -> _Export:
+    """Export through the v1 trace API, for a server without Observations API v2, grouped as :func:`_extract_langfuse` groups."""
     truncated: list[str] = []
+
     # Each list-row is one trace; pull its full observation tree by id so the backend
     # sees the whole agent run, not just the trace envelope.
-    for row in _iter_recent_traces(api, limit, filters=filters):
-        trace_id = str(row.id)
-        payload = _fetch_trace_tree(api, trace_id, row, truncated=truncated)
-        (traces_dir / _trace_file(trace_id)).write_text(json.dumps(_langfuse_to_dict(payload), ensure_ascii=False, default=str))
-        written += 1
-    return _Export(written, {'read_api': 'v1', 'truncated_trace_ids': truncated})
+    def tree(row: TraceWithDetails) -> dict[str, Any]:
+        return _langfuse_to_dict(_fetch_trace_tree(api, str(row.id), row, truncated=truncated))
+
+    if group == 'trace':
+        written = 0
+        for row in _iter_recent_traces(api, limit, filters=filters):
+            (traces_dir / _trace_file(str(row.id))).write_text(json.dumps(tree(row), ensure_ascii=False, default=str))
+            written += 1
+        return _Export(written, {'read_api': 'v1', 'unit': 'trace', 'truncated_trace_ids': truncated})
+
+    files = _ConversationFiles(traces_dir)
+    listed = _iter_recent_traces(api, None, filters=filters)
+    for session_id, newest in _recent_conversations(listed, limit, conversation_of=_langfuse_session, trace_of=lambda row: str(row.id)):
+        session = files.roots_of(session_id, newest, lambda conversation: _session_traces_v1(api, conversation, filters))
+        files.write(session_id, str(newest.id), [tree(row) for row in session], len(session))
+    return _Export(len(files.thread_files), {'read_api': 'v1', 'truncated_trace_ids': truncated, 'limit': limit, **files.selection()})
 
 
 _EXPORT_DIR_KEYS = frozenset({'path', 'thread_ids'})
@@ -827,6 +1038,12 @@ def _root_runs(payload: Any) -> int:
     return 1
 
 
+def _trace_ids_held(payload: Any) -> set[str]:
+    """The trace ids a trace file holds: each record's ``trace_id`` (a LangSmith run) or ``id`` (a Langfuse trace object)."""
+    records = payload if isinstance(payload, list) else [payload]
+    return {str(r.get('trace_id') or r.get('id')) for r in records if isinstance(r, dict) and (r.get('trace_id') or r.get('id'))}
+
+
 def _extract_export_dir(source_config: dict[str, Any], traces_dir: Path, limit: int | None) -> _Export:
     """Read a directory ``extract_traces`` wrote and copy its trace files, byte for byte, under ``traces_dir``.
 
@@ -886,12 +1103,14 @@ def _extract_export_dir(source_config: dict[str, Any], traces_dir: Path, limit: 
         chosen = dict(list(chosen.items())[:limit])
 
     root_count = 0
+    held: set[str] = set()  # the trace ids the chosen files hold; a conversation file holds several
     for name in chosen:
         try:
             payload = json.loads(files[name].read_text(encoding='utf-8'))
         except (OSError, ValueError) as e:
             raise TraceExportError(f'export_dir {TRACES_DIRNAME}/{name} in {root} is not readable JSON ({type(e).__name__}).') from None
         root_count += _root_runs(payload)
+        held |= _trace_ids_held(payload)
         shutil.copyfile(files[name], traces_dir / name)
 
     if unmatched and chosen:
@@ -910,7 +1129,7 @@ def _extract_export_dir(source_config: dict[str, Any], traces_dir: Path, limit: 
         selection['thread_files'] = threads
     for key in ('truncated_trace_ids', 'scores_unread_trace_ids'):
         if isinstance(original.get(key), list):
-            selection[key] = [t for t in original[key] if _trace_file(t) in chosen]
+            selection[key] = [t for t in original[key] if t in held or _trace_file(t) in chosen]
     if isinstance(original.get('read_api'), str):
         selection['read_api'] = original['read_api']
     selection['export_dir'] = {'path': str(root), 'trace_count': manifest['trace_count']}
@@ -922,8 +1141,8 @@ def _extract_export_dir(source_config: dict[str, Any], traces_dir: Path, limit: 
 # ships the client. Extend with arize / braintrust as needed (the SDK already
 # wraps those sinks under plurai.observability).
 TRACE_SOURCE_REGISTRY: dict[str, _SourceSpec] = {
-    'langsmith': _SourceSpec(_extract_langsmith, 'langsmith', ('filter', 'thread_ids')),
-    'langfuse': _SourceSpec(_extract_langfuse, 'langfuse', ('environment', 'name')),
+    'langsmith': _SourceSpec(_extract_langsmith, 'langsmith', ('filter', 'group', 'thread_ids')),
+    'langfuse': _SourceSpec(_extract_langfuse, 'langfuse', ('environment', 'group', 'name')),
     'export_dir': _SourceSpec(_extract_export_dir, None, ('thread_ids',), _export_dir_preflight),
 }
 
@@ -1024,8 +1243,10 @@ def extract_traces(
     out_dir:
         Directory to write ``traces/`` + ``manifest.json`` into (created if missing).
     limit:
-        Optional cap on the number of files to export (None = all): traces, or
-        conversations for a LangSmith export by ``thread_ids``.
+        Optional cap on the number of files to export, newest first (None = all):
+        conversations by default (``source_config["group"]`` unset or ``"conversation"``,
+        or a LangSmith export by ``thread_ids``), traces with ``"group": "trace"``. A
+        conversation is never cut short to meet it.
 
     Returns
     -------

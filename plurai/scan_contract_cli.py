@@ -123,6 +123,7 @@ from plurai.scan_contract.report import DeclarationProblem
 from plurai.scan_contract.services import load_service_indicators
 from plurai.scan_contract.smoke_execution import DEFAULT_PROBE_TIMEOUT, execute_smoke_probes, record_execution_in_report, subprocess_transport
 from plurai.scan_contract.smoke_probes import DEFAULT_SMOKE_BUDGET, SmokeProbeSet
+from plurai.host_effects import shippable_contract
 from plurai.user_path import expand_user_path
 
 #: The two artifacts, named exactly as the backend names them: ``recheck --against`` reads the first,
@@ -460,6 +461,9 @@ def _cmd_check(args: argparse.Namespace) -> int:
         # ``source_inventory`` (the other carried inputs); ABSENT when nothing declared — an empty
         # ``verbs`` list here is a declaration, and only ever that.
         payload[RENDER_ACTIONS_KEY] = render_surface.as_record()
+    # The artifact is uploaded and committed, so the roots and the render surface's config are named from the project,
+    # the folder the scan runs in. The payload is a copy: the report object the rendered markdown reads is unchanged.
+    payload = shippable_contract(payload, typed_from=Path.cwd())
     _atomic_write_text(args.out / ARTIFACT_FILENAME, json.dumps(payload, indent=2, ensure_ascii=False))
     _atomic_write_text(args.out / REPORT_FILENAME, rendered)
     # INTERNAL: never inside the artifact and never beside it — the overrule reasons it carries must
