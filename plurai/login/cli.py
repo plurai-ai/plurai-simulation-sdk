@@ -192,8 +192,8 @@ def _environment_note(env: Mapping[str, str]) -> str | None:
         )
     if token:
         return (
-            f'{TOKEN_ENV} is set and {URL_ENV} is not: other commands refuse, because a token is only sent to the backend it was issued for '
-            f"and is not combined with the saved credential's url. Set {URL_ENV} too, or unset {TOKEN_ENV} to use the saved credential."
+            f'{TOKEN_ENV} is set and {URL_ENV} is not: other commands send that token to production and ignore the saved credential. '
+            f'Unset {TOKEN_ENV} to use the saved credential.'
         )
     return None
 

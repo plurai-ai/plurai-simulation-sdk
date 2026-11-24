@@ -1397,7 +1397,7 @@ def _apply_trim(
     if trimmed is None:
         raise TraceConversionError(
             f'{source}: --trim-mid-turn-tail has nothing to trim back to — no message in this history ends a completed '
-            "agent turn the backend would seed from (an ai message carrying no tool calls, or tool results answering the "
+            'agent turn the backend would seed from (an ai message carrying no tool calls, or tool results answering the '
             "agent's last call with a user message right after them, and every earlier tool call answered), so the trim "
             'would leave no conversation to resume from.'
         )
@@ -1691,7 +1691,7 @@ def _langsmith_front_end(source_path: Path) -> SourceProjection:
                 observed={},
                 remedy=(
                     f'The conversation was read from the "{channel}" channel, the only one holding messages. The resumed '
-                    f"agent is seeded from the pin's messages: its harness must write them into \"{channel}\", not into "
+                    f'agent is seeded from the pin\'s messages: its harness must write them into "{channel}", not into '
                     '"messages", or the seed does not restore.'
                 ),
                 draft_ref=None,
@@ -2351,9 +2351,7 @@ def _state_entering_turn(projection: SourceProjection, turn: int) -> dict[str, A
     return None
 
 
-def _convert_one(
-    source_path: Path, spec: _FormatSpec, *, resume_point: ResumePoint | None, trim_mid_turn_tail: bool, cut_turn: int | None
-) -> ThreadConversion:
+def _convert_one(source_path: Path, spec: _FormatSpec, *, resume_point: ResumePoint | None, trim_mid_turn_tail: bool, cut_turn: int | None) -> ThreadConversion:
     """One trace artifact → its :class:`ThreadConversion` (pure, no I/O beyond the read).
 
     The FORMAT half is ``spec``'s front end; everything from here down is shared by every
@@ -2965,8 +2963,7 @@ def _render_world_facts(facts: WorldFacts, *, origin: str, heading: str) -> str:
 _ROLES_STATE_PHRASES = {
     None: "the agent's final state values",
     'cut': "the agent's state values as of the cut",
-    'withheld': 'no state values — this source records one state for the whole conversation, reached after the cut, '
-    'so the pin seeds the conversation alone',
+    'withheld': 'no state values — this source records one state for the whole conversation, reached after the cut, so the pin seeds the conversation alone',
     'end': "the agent's state values from the END of the recorded conversation, past the cut — this source "
     'records one state for the whole conversation rather than one per turn',
 }
@@ -3013,9 +3010,9 @@ def _render_roles_body(conversion: ThreadConversion, *, heading: str) -> str:
 
 {heading} Provenance
 
-* Source export: `{_provenance_display(provenance["source_file"])}`
-* Thread id: `{_provenance_display(provenance["thread_id"])}`
-* Converted by: {_provenance_display(provenance["converted_by"])}
+* Source export: `{_provenance_display(provenance['source_file'])}`
+* Thread id: `{_provenance_display(provenance['thread_id'])}`
+* Converted by: {_provenance_display(provenance['converted_by'])}
 {extras}
 """
     if conversion.world_facts is None:

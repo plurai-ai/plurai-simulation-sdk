@@ -76,6 +76,7 @@ import httpx
 
 from plurai import client_handshake, exit_codes
 from plurai.customer_safe import response_json
+from plurai.atomic_write import write_atomic
 from plurai.ingest._command import (
     TRANSIENT_STATUS_CODES,
     CommandError,
@@ -86,7 +87,6 @@ from plurai.ingest._command import (
     resolve_target,
     say,
     upgrade_required,
-    write_atomic,
 )
 
 

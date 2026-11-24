@@ -3,8 +3,8 @@
 A command resolves its target from the configuration (:func:`resolve_target`), sends the bearer only
 when one is set (:func:`client`), classifies each answer into an exit code (:class:`CommandError`),
 keeps stdout for the one value a caller parses and puts everything else on stderr under its own
-prefix (:func:`say`). Files land through a temp file and a rename (:func:`write_atomic`), so a
-failed command never truncates a good one. The exit codes below are the rows the commands have in
+prefix (:func:`say`). Files land through :func:`plurai.atomic_write.write_atomic`, so a failed command never truncates a
+good one. The exit codes below are the rows the commands have in
 common; each command's docstring lists the rows it uses, and :mod:`plurai.exit_codes` holds the table.
 """
 
@@ -13,9 +13,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-import os
 from collections.abc import Awaitable, Callable, Iterator
-from pathlib import Path
 from typing import TextIO
 
 import httpx
@@ -164,23 +162,6 @@ def prefixed_warnings(prefix: str, err: TextIO) -> Iterator[None]:
         logger.propagate = propagate
 
 
-def write_atomic(dest: Path, content: bytes) -> None:
-    """``content`` to ``dest`` through a temp file beside it and a rename; on failure the temp
-    file is removed and ``dest`` is untouched.
-
-    Raises:
-        OSError: from the write or the rename.
-    """
-    tmp = dest.with_name(f'.{dest.name}.{os.getpid()}.tmp')
-    try:
-        tmp.write_bytes(content)
-        tmp.replace(dest)
-    except OSError:
-        with contextlib.suppress(OSError):
-            tmp.unlink(missing_ok=True)
-        raise
-
-
 __all__ = [
     'MAX_REDIRECTS',
     'TRANSIENT_STATUS_CODES',
@@ -192,5 +173,4 @@ __all__ = [
     'resolve_target',
     'say',
     'send_with_retry',
-    'write_atomic',
 ]

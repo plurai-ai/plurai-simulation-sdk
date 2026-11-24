@@ -401,7 +401,7 @@ _LAST_EGRESS_RECORD: dict[str, Any] = {}
 _LAST_EGRESS_DECLARED: set[str] = set()
 
 
-def _preflight_egress(cfg: _RunConfig, settings: Settings, *, keep_guard_log: bool) -> None:
+def _preflight_egress(cfg: RunConfig, settings: Settings, *, keep_guard_log: bool) -> None:
     """Arm the egress guard from the declaration, then measure whether the agent can reach PRODUCTION.
 
     ENFORCEMENT FIRST, AND FROM THE DECLARATION ALONE. The in-process guard (:mod:`plurai.egress_guard`)
@@ -471,7 +471,7 @@ def _preflight_egress(cfg: _RunConfig, settings: Settings, *, keep_guard_log: bo
         print(line, file=sys.stderr)
 
 
-def _egress_crashed(cfg: _RunConfig, gates: Any, exc: Exception, *, phase: str, enforcement: str | None) -> None:
+def _egress_crashed(cfg: RunConfig, gates: Any, exc: Exception, *, phase: str, enforcement: str | None) -> None:
     """A preflight that raised: recorded as ``unprovable`` and reported as a finding. Never a refusal.
 
     The evidence is the exception CLASS and the phase only; the message moves between runs, so it rides
@@ -511,7 +511,7 @@ def _unguarded_unmeasured(exc: Exception, *, phase: str) -> GateFinding:
     )
 
 
-def _guard_withdrawal(cfg: _RunConfig, gates: Any, allowed: tuple[str, ...], *, harness_suffix: str, mock_mode: str) -> Callable[[], str | None]:
+def _guard_withdrawal(cfg: RunConfig, gates: Any, allowed: tuple[str, ...], *, harness_suffix: str, mock_mode: str) -> Callable[[], str | None]:
     """What a child that does NOT confirm the guard gets: `guarded` withdrawn, and the probe measures, once.
 
     ``gates`` is the invocation's collector, captured here because the hook runs on a worker thread. The
@@ -799,7 +799,7 @@ SCAN_CONTRACT_RECHECK_FILENAME = 'scan_contract_recheck.json'
 _LAST_SCAN_DRIFT_RECORD: dict[str, Any] = {}
 
 
-def _preflight_scan_contract(cfg: _RunConfig) -> GateFinding | None:
+def _preflight_scan_contract(cfg: RunConfig) -> GateFinding | None:
     """Are the sources this suite was built over still the sources on this machine?
 
     Returns the ``run.scan_source_drift`` finding for a FULL run whose corpus MEASURABLY changed —
@@ -894,7 +894,7 @@ def _preflight_scan_contract(cfg: _RunConfig) -> GateFinding | None:
     return finding
 
 
-def _scan_drift_outcome(cfg: _RunConfig, baseline_path: Path) -> dict[str, Any]:
+def _scan_drift_outcome(cfg: RunConfig, baseline_path: Path) -> dict[str, Any]:
     """The drift comparison as a record, or the reason it could not be made.
 
     ``checked`` is the field that decides everything downstream, and the three ways a comparison
@@ -1314,6 +1314,37 @@ class _UnavailableAbort(_BackendRefusedAbort):
         return UnavailableBlock(self.cause, self.code).to_record()
 
 
+@dataclass(frozen=True, slots=True)
+class _RefusedAbort(_BackendRefusedAbort):
+    """The backend refused the run itself on one of its own routes: the token (401), the token's rights (403) or this SDK
+    version (426). Every further call carries the same token and version and gets the same answer, so the run stops at the
+    first one and keeps what it measured; the scenario's ``error.json`` keeps the status (and a 426's ``upgrade`` block)."""
+
+    reason: ClassVar[str] = 'refused'
+    route_cause: ClassVar[MockRouteCause] = 'auth'
+
+    status: int
+
+    def _record_fields(self) -> dict[str, Any]:
+        return {'status': self.status}
+
+    @property
+    def cause_phrase(self) -> str:
+        return f'the backend refused this run (HTTP {self.status})'
+
+    @property
+    def fail_record(self) -> tuple[str, str]:
+        return self.fail_exception, 'the run was stopped because the backend refused it'
+
+    @property
+    def stopped_by(self) -> str:
+        return self.cause_phrase
+
+
+#: The answers of a backend route that refuse the run itself rather than one request (:class:`_RefusedAbort`).
+_RUN_REFUSAL_STATUSES: Final = frozenset({401, 403, client_handshake.UPGRADE_STATUS})
+
+
 class BackendUnavailable(Exception):  # noqa: N818  # named for the stop it records, not as an error of ours
     """The failure record of a scenario the unavailable stop ended: what ``error.json`` and ``/fail`` carry in place of the
     transport's own text, which names a status, a URL or an id. It has the name the cancelled scenarios' ``/fail`` carries
@@ -1324,12 +1355,12 @@ class BackendUnavailable(Exception):  # noqa: N818  # named for the stop it reco
         self.unavailable = block
 
 
-#: The stops that keep what the run measured: a refusal of the organization's credit, of the backend's capacity, or the
-#: backend being unavailable.
-_MeasuredStop = _CreditAbort | _CapacityAbort | _UnavailableAbort
+#: The stops that keep what the run measured: a refusal of the organization's credit, of the backend's capacity, of the run's
+#: token or SDK version, or the backend being unavailable.
+_MeasuredStop = _CreditAbort | _CapacityAbort | _UnavailableAbort | _RefusedAbort
 
 #: Every way a run can be stopped as a whole.
-_RunAbort = _MockAbort | _CreditAbort | _CapacityAbort | _UnavailableAbort
+_RunAbort = _MockAbort | _CreditAbort | _CapacityAbort | _UnavailableAbort | _RefusedAbort
 
 #: The one abort of the running invocation, shared by every trial and both strategies: the mock and the organization's
 #: credit are the run's, not a trial's, so a ledger per trial would let trial 2 keep going after trial 1 found them dead.
@@ -1644,18 +1675,32 @@ def _unavailable_abort_from(scenario_id: str, evidence: BaseException | Sequence
     return _UnavailableAbort(scenario_id=scenario_id, remedy=UNAVAILABLE_TEXT, cause=block.cause, code=block.code)
 
 
+def _refused_abort_from(scenario_id: str, evidence: BaseException | Sequence[Mapping[str, Any]]) -> _RefusedAbort | None:
+    """The refusal abort ``evidence`` shows: a backend route's own 401, 403 or 426 (:data:`_RUN_REFUSAL_STATUSES`); ``None`` for
+    any other error. A hosted mock's 401 is the mock's stop (:func:`_stop_run_if_mock_cannot_answer`), never this one."""
+    if not isinstance(evidence, ServerHTTPError) or evidence.status not in _RUN_REFUSAL_STATUSES:
+        return None
+    if evidence.status == client_handshake.UPGRADE_STATUS:
+        remedy = client_handshake.upgrade_message_for(evidence.response)
+    elif evidence.status == 401:
+        remedy = f'The backend rejected the token this run sent: it is expired, revoked or wrong. Fix it: {CREDENTIAL_FIX}.'
+    else:
+        remedy = 'The backend refused the token this run sent for a route the run needs. Use a key that may run simulations.'
+    return _RefusedAbort(scenario_id=scenario_id, remedy=remedy, status=evidence.status)
+
+
 def _stop_run_if_refused(scenario_id: str, evidence: BaseException | Sequence[Mapping[str, Any]], *, billing_url: str) -> _MeasuredStop | None:
-    """Stop the run when ``evidence`` is a credit refusal (:func:`_stop_run_if_credit_refused`), a capacity refusal, or the
-    backend's own typed ``unavailable`` answer, and return what it shows; ``None`` for any other error. Each is the same answer
-    on a re-drive and for every other scenario, so the run stops on the first one and keeps what it measured; credit is read
-    first.
+    """Stop the run when ``evidence`` is a credit refusal (:func:`_stop_run_if_credit_refused`), a capacity refusal, a refusal
+    of the run's token or SDK version (:func:`_refused_abort_from`), or the backend's own typed ``unavailable`` answer, and
+    return what it shows; ``None`` for any other error. Each is the same answer on a re-drive and for every other scenario, so
+    the run stops on the first one and keeps what it measured; credit is read first.
 
     An outage is recovered before it stops anything, so it is not read here: a request that waited out its transient budget
     (:func:`~plurai.orchestrator.redrive.backend_outage`) and a hosted mock's unavailable answer go to the re-drive, and the
     first stops the run only once recovery failed (:func:`_stop_run_for_outage`)."""
     if (credit := _stop_run_if_credit_refused(scenario_id, evidence, billing_url=billing_url)) is not None:
         return credit
-    found: _CapacityAbort | _UnavailableAbort | None = _capacity_abort_from(scenario_id, evidence)
+    found: _CapacityAbort | _RefusedAbort | _UnavailableAbort | None = _capacity_abort_from(scenario_id, evidence) or _refused_abort_from(scenario_id, evidence)
     if found is None and isinstance(evidence, BaseException) and not _recovered_first(evidence):
         found = _unavailable_abort_from(scenario_id, evidence)
     if found is not None:
@@ -1910,7 +1955,7 @@ async def _close_attempt_cancelled_by_abort(orch: Orchestrator, abort: _RunAbort
     await _close_thread(orch, orch.thread_id, exception=exception, error=error)
 
 
-def _write_mock_abort_summary(cfg: _RunConfig, abort: _MockAbort, *, run_name: str | None) -> _RunVerdict:
+def _write_mock_abort_summary(cfg: RunConfig, abort: _MockAbort, *, run_name: str | None) -> _RunVerdict:
     """``run_summary.json`` for an aborted run: the reason and no verdicts.
 
     No row is passed, so no policy verdict, score or pass rate is published for a run whose mock answered nothing a score
@@ -1919,7 +1964,7 @@ def _write_mock_abort_summary(cfg: _RunConfig, abort: _MockAbort, *, run_name: s
     return _write_run_summary(cfg.out, exit_code=exit_codes.MOCK_UNANSWERED, scenarios={}, graded=set(), cfg=cfg, run_name=run_name, aborted=abort.to_record())
 
 
-def _publish_mock_abort(cfg: _RunConfig, abort: _MockAbort, *, run_name: str | None) -> int:
+def _publish_mock_abort(cfg: RunConfig, abort: _MockAbort, *, run_name: str | None) -> int:
     """The terminal side of an abort: the remedy on stderr, the summary on disk, :data:`exit_codes.MOCK_UNANSWERED` back."""
     where = f'scenario {abort.scenario_id}' + (f', tool {abort.tool}' if abort.tool else '')
     print(
@@ -1933,7 +1978,7 @@ def _publish_mock_abort(cfg: _RunConfig, abort: _MockAbort, *, run_name: str | N
     return exit_codes.MOCK_UNANSWERED
 
 
-def _stamp_credit_abort(cfg: _RunConfig, abort: _MeasuredStop, *, run_name: str | None) -> None:
+def _stamp_credit_abort(cfg: RunConfig, abort: _MeasuredStop, *, run_name: str | None) -> None:
     """Put the credit (or capacity) stop into ``$OUT``'s ``run_summary.json`` of a ``--trials N`` run, so a reader finds it in one place.
 
     ``$OUT`` holds trial 1's own summary; a trial that finished before the refusal wrote it without an abort. The stop
@@ -1950,7 +1995,7 @@ def _stamp_credit_abort(cfg: _RunConfig, abort: _MeasuredStop, *, run_name: str 
         logger.warning('could not record the credit stop in %s', path, exc_info=True)
 
 
-def _publish_credit_stop_before_any_scenario(cfg: _RunConfig, refusal: CreditRefused, settings: Settings) -> int:
+def _publish_credit_stop_before_any_scenario(cfg: RunConfig, refusal: CreditRefused, settings: Settings) -> int:
     """The credit stop of a run the backend refused before any scenario began: the sentence, the summary, exit 20."""
     block = refusal.credit
     abort = _CreditAbort(
@@ -1974,7 +2019,7 @@ def _reraise_outage(exc: BaseException) -> None:
         raise exc
 
 
-def _stop_for_outage_before_any_scenario(cfg: _RunConfig, failure: BaseException) -> int:
+def _stop_for_outage_before_any_scenario(cfg: RunConfig, failure: BaseException) -> int:
     """The unavailable stop of a run that owns ``--out`` and began no scenario because the backend could not serve a read: the
     summary, the text once, exit 20. Re-raises *failure* when it carries no unavailable block (:func:`unavailable_block_of`)."""
     block = unavailable_block_of(failure)
@@ -2648,7 +2693,7 @@ def _stamped_solvability(metadata: Any) -> str:
     return 'untested'
 
 
-async def _preflight_solvability(cfg: _RunConfig, settings: Settings) -> dict[str, Mapping[str, Any]] | None:
+async def _preflight_solvability(cfg: RunConfig, settings: Settings) -> dict[str, Mapping[str, Any]] | None:
     """Read each scenario's solvability stamp from the backend, AT RUN START.
 
     The stamp rides ``scenario.yaml``'s ``scenario:`` block and reaches a client only through
@@ -2787,7 +2832,7 @@ def _harness_opens(simulate_path: Path) -> bool:
         return False
 
 
-def _resolve_max_turns(cfg: _RunConfig, rows: Mapping[str, Mapping[str, Any]] | None) -> _RunConfig:
+def _resolve_max_turns(cfg: RunConfig, rows: Mapping[str, Mapping[str, Any]] | None) -> RunConfig:
     """The run's turn cap, resolved ONCE after the set fetch: the operator's flag, else derived from
     the scenarios this run plays (:func:`derive_max_turns`), else :data:`DEFAULT_MAX_TURNS` with one
     warning. The source travels on the config into ``run_summary.json``."""
@@ -2878,7 +2923,7 @@ def _record_eval_set_unverified(eval_set_id: str, why: str) -> None:
     )
 
 
-async def _preflight_eval_set(cfg: _RunConfig, settings: Settings) -> str | None:
+async def _preflight_eval_set(cfg: RunConfig, settings: Settings) -> str | None:
     """Refuse a run whose ``--eval-set-id`` the backend has already rejected.
 
     A no-op without ``--eval-set-id``. Otherwise one cheap authenticated read of
@@ -3561,7 +3606,7 @@ def _family_gradient(rows: Iterable[dict[str, Any] | None]) -> dict[str, Any]:
     return {'families': families, 'coverage': {'reported': reported, 'population': population}}
 
 
-def _turn_cap_rerun_allowed(cfg: _RunConfig) -> bool:
+def _turn_cap_rerun_allowed(cfg: RunConfig) -> bool:
     """May this run spend a ceiling-hit re-run? Asked in TWO frames, so it is answered once.
 
     The scenario driver spends the budget; the vendor executor sizes its task timeout off the
@@ -3573,7 +3618,7 @@ def _turn_cap_rerun_allowed(cfg: _RunConfig) -> bool:
     return cfg.rerun_on_turn_cap and cfg.run_phase != 'qualification'
 
 
-def _resolve_scenario_budget(cfg: _RunConfig, settings: Settings) -> float:
+def _resolve_scenario_budget(cfg: RunConfig, settings: Settings) -> float:
     """The per-scenario time budget in force, from the ONE place that knows both halves.
 
     ``_settings_from_args`` always fills the field (flag > env > phase default), so the fallback
@@ -3584,7 +3629,7 @@ def _resolve_scenario_budget(cfg: _RunConfig, settings: Settings) -> float:
     return settings.network.scenario_timeout or default_scenario_time_budget(cfg.run_phase)
 
 
-def _worst_case_scenario_ceiling(cfg: _RunConfig, settings: Settings) -> float:
+def _worst_case_scenario_ceiling(cfg: RunConfig, settings: Settings) -> float:
     """The largest hard ceiling ANY attempt of one scenario can run under.
 
     A scenario is not one attempt. A turn-cap re-run doubles both the turn allowance and the
@@ -4068,7 +4113,7 @@ def _echoes_dropped_ids(pairs: Iterable[tuple[str, ThreadResult | None]]) -> dic
     }
 
 
-def _graded_ids(cfg: _RunConfig, pairs: Iterable[tuple[str, ThreadResult | None]]) -> set[str]:
+def _graded_ids(cfg: RunConfig, pairs: Iterable[tuple[str, ThreadResult | None]]) -> set[str]:
     """The ids whose scenario actually produced a policy verdict.
 
     Gated on ``cfg.is_scored`` AS WELL AS the evidence, deliberately: with no eval set
@@ -4442,7 +4487,7 @@ def _resolve_run_verdict(
     *,
     scenarios: dict[str, str],
     graded: set[str],
-    cfg: _RunConfig,
+    cfg: RunConfig,
     ended_early: dict[str, str] | None = None,
     ended_early_causes: dict[str, str] | None = None,
     measurement_integrity: dict[str, Any] | None = None,
@@ -4594,7 +4639,7 @@ def _child_python() -> str:
     return os.environ.get('PLURAI_CHILD_PYTHON') or sys.executable
 
 
-def _preflight_host_toolchain(cfg: _RunConfig) -> None:
+def _preflight_host_toolchain(cfg: RunConfig) -> None:
     """Report, before any spend, what this host does not give the agent of what its own files declare it needs.
 
     Every ``harness.host_requirements`` entry is resolved where the agent will use it, in the AGENT's
@@ -4724,7 +4769,7 @@ def _write_run_summary(
     exit_code: int,
     scenarios: dict[str, str],
     graded: set[str],
-    cfg: _RunConfig,
+    cfg: RunConfig,
     run_name: str | None = None,
     ended_early: dict[str, str] | None = None,
     ended_early_causes: dict[str, str] | None = None,
@@ -5124,20 +5169,21 @@ def _write_run_summary(
     # A TRIAL of a ``--trials N`` run never publishes it: N concurrent trials would race for one
     # pointer, and the one it must name is ``$OUT`` — published once, by :func:`_publish_trials`.
     # ``--no-run-pointer`` (a side run into its own --out, e.g. regression replays) leaves it alone.
-    # A run stopped for credit, capacity or an unavailable backend is not the run the next command should describe, so it leaves the pointer as it was.
-    measured_stop = isinstance(aborted, Mapping) and aborted.get('reason') in ('credit', 'capacity', 'unavailable')
+    # A run stopped for credit, capacity, a refusal or an unavailable backend is not the run the next command should describe,
+    # so it leaves the pointer as it was.
+    measured_stop = isinstance(aborted, Mapping) and aborted.get('reason') in ('credit', 'capacity', 'unavailable', 'refused')
     if verdict.ran and cfg.trial is None and not cfg.no_run_pointer and not measured_stop:
         _publish_run_pointer(cfg, out)
     return verdict
 
 
-def _replay_mode_of_run(cfg: _RunConfig) -> str:
+def _replay_mode_of_run(cfg: RunConfig) -> str:
     """``single_hop`` for a ``--replay-turn-only`` run, else ``full`` (:data:`plurai.trials.ReplayMode`); a run whose
     plan played some scenarios single-hop names them in ``single_hop_scenarios`` (:func:`_single_hop_scenarios`)."""
     return 'single_hop' if cfg.replay_turn_only else 'full'
 
 
-def _single_hop_scenarios(cfg: _RunConfig, scenarios: Mapping[str, Any]) -> list[str]:
+def _single_hop_scenarios(cfg: RunConfig, scenarios: Mapping[str, Any]) -> list[str]:
     """The scenarios of this run the replay plan played single-hop, sorted; ``[]`` for a run-level mode."""
     return [] if cfg.replay_turn_only else sorted(sid for sid in scenarios if sid in cfg.single_hop_ids)
 
@@ -5189,7 +5235,7 @@ def _scores_or_nothing(out: Path, summary: Mapping[str, Any]) -> dict[str, Any]:
         return {}
 
 
-def _own_scores(cfg: _RunConfig, out: Path, scenarios: Mapping[str, Any], cell_blocks: Mapping[str, Any]) -> dict[str, Any]:
+def _own_scores(cfg: RunConfig, out: Path, scenarios: Mapping[str, Any], cell_blocks: Mapping[str, Any]) -> dict[str, Any]:
     """The recorded likelihoods and the ``scores`` block for ONE run's summary. A trial ``k > 1`` of a ``--trials N``
     run writes neither: ``$OUT``'s composed summary holds the one block, over every trial. ``cell_blocks``' run totals
     take their pass count off the block (:func:`plurai.scoring.align_totals`, in place)."""
@@ -5201,7 +5247,7 @@ def _own_scores(cfg: _RunConfig, out: Path, scenarios: Mapping[str, Any], cell_b
     return {scoring.LIKELIHOODS_KEY: likelihoods, **scored}
 
 
-def _carried_trials_block(cfg: _RunConfig, out: Path) -> dict[str, Any]:
+def _carried_trials_block(cfg: RunConfig, out: Path) -> dict[str, Any]:
     """``{'trials': <the block already in out's summary>}`` when this write replaces ``$OUT``'s
     summary in a ``--trials N`` run, else ``{}``."""
     if cfg.trials < 2 or (cfg.trial is not None and cfg.trial.index != 1):
@@ -5265,7 +5311,7 @@ def _prior_run_detail(path: Path) -> str:
     return f'run_name={prior.get("run_name")!r}, written_at={prior.get("written_at")!r}, {prior.get("total")} scenario(s)'
 
 
-def _occupied_out_refusal(cfg: _RunConfig) -> str | None:
+def _occupied_out_refusal(cfg: RunConfig) -> str | None:
     """REFUSE a whole-set run into an ``--out`` that already holds a run's verdict — the THIRD
     disposition, beside the merge (:func:`_merge_prior_scenarios`) and the clear
     (:func:`_clear_stale_run_summary`).
@@ -5301,7 +5347,7 @@ def _occupied_out_refusal(cfg: _RunConfig) -> str | None:
     )
 
 
-def _invariant_exit(cfg: _RunConfig | None) -> int | None:
+def _invariant_exit(cfg: RunConfig | None) -> int | None:
     """After a rung that later rungs depend on: the funnel's refusal code when a HARD finding was reported,
     else ``None`` (advisory findings accumulate until the funnel). ``cfg`` is ``None`` before the run owns
     ``--out``, so nothing is re-published there."""
@@ -5312,7 +5358,7 @@ def _invariant_exit(cfg: _RunConfig | None) -> int | None:
     return _held_by_gates(cfg)
 
 
-def _relative_to_bench(path: Path, cfg: _RunConfig) -> str:
+def _relative_to_bench(path: Path, cfg: RunConfig) -> str:
     """``path`` relative to the bench root, for stable finding evidence (an absolute path moves between machines)."""
     try:
         return str(Path(path).resolve().relative_to(harness_project(cfg.agent_module_path).resolve()))
@@ -5331,7 +5377,7 @@ def _unreadable_declaration(declaration: str, exc: Exception) -> dict[str, Any]:
     }
 
 
-def _held_by_gates(cfg: _RunConfig) -> int | None:
+def _held_by_gates(cfg: RunConfig) -> int | None:
     """THE gate funnel at a pre-spend point: the refusal code when a finding reported so far holds the run
     (a security or invariant one, or a holding advisory one no ``--overrule`` lifted), after re-publishing
     the summary for an exit that ran nothing; ``None`` otherwise. A finding that holds nothing never stops a run."""
@@ -5341,7 +5387,7 @@ def _held_by_gates(cfg: _RunConfig) -> int | None:
     return held_code
 
 
-def _publish_early_exit(cfg: _RunConfig, exit_code: int) -> None:
+def _publish_early_exit(cfg: RunConfig, exit_code: int) -> None:
     """Re-publish the summary for a guard exit that ran NOTHING.
 
     A full run's file was already dropped at strategy entry, so this is a no-op there. A
@@ -5393,7 +5439,7 @@ def _policy_name_list(per: dict[str, Any], key: str) -> list[Any] | None:
 
 
 def _run_context(
-    cfg: _RunConfig,
+    cfg: RunConfig,
     settings: Settings,
     *,
     dataset_name: str | None,
@@ -5440,7 +5486,7 @@ def _run_context(
     }
 
 
-def _trial_facts(cfg: _RunConfig) -> dict[str, Any]:
+def _trial_facts(cfg: RunConfig) -> dict[str, Any]:
     """``trial_index`` / ``trial_count`` / ``trial_group`` for a trial body's config, else ``{}``.
 
     One spelling for the transcript's ``metadata`` and the sinks' run facts
@@ -5451,7 +5497,7 @@ def _trial_facts(cfg: _RunConfig) -> dict[str, Any]:
     return {'trial_index': cfg.trial.index, 'trial_count': cfg.trial.count, 'trial_group': cfg.trial.group}
 
 
-def _scenario_run_facts(cfg: _RunConfig, *, run_name: str | None, scenario_id: str) -> dict[str, Any]:
+def _scenario_run_facts(cfg: RunConfig, *, run_name: str | None, scenario_id: str) -> dict[str, Any]:
     """The run facts a scenario's sink record carries (``eval_mapping.RUN_FACT_KEYS``).
 
     ``run_id`` is ``run_name`` (the per-invocation handle written to ``run_summary.json`` and the
@@ -5913,7 +5959,7 @@ class _SupersededAttempt:
 
 
 def _restore_superseded_attempt(
-    cfg: _RunConfig,
+    cfg: RunConfig,
     settings: Settings,
     scenario_out: Path,
     *,
@@ -6407,6 +6453,9 @@ def _write_error(
         record['response_body'] = description
     if error_id := error_id_of(body):
         record['error_id'] = error_id
+    # A version refusal (HTTP 426): its typed fields, so a reader that must name the floor does not parse the description above.
+    if isinstance(exc, ServerHTTPError) and (refusal := client_handshake.refusal_from(exc.status, body)) is not None:
+        record['upgrade'] = refusal.record()
     # WHAT THIS FAILURE INTERRUPTED. A scenario ceiling that expires while the finalize poll is
     # sleeping off a network outage raises ScenarioTimeout with the transport failure as its
     # context — without the chain the record says only "raise --scenario-timeout", with no
@@ -6503,7 +6552,7 @@ def _ts() -> str:
     return time.strftime('%H:%M:%S')
 
 
-def _row_label(cfg: _RunConfig, scenario_id: str) -> str:
+def _row_label(cfg: RunConfig, scenario_id: str) -> str:
     """How a row's progress lines name it: the scenario id, and in a ``--trials N`` run its trial too (``<id>#t2``), since
     every trial runs the same ids side by side and their lines interleave."""
     return f'{scenario_id}#t{cfg.trial.index}' if cfg.trial is not None and cfg.trial.count > 1 else scenario_id
@@ -7542,7 +7591,7 @@ class _RetryRefusal:
     signals: dict[InfrastructureSignal, int] = dataclasses_field(default_factory=dict)
 
 
-def _retry_refusal(cfg: _RunConfig, budget: _StabilityBudget | None, scenario_id: str, reason: StabilityReason) -> _RetryRefusal | None:
+def _retry_refusal(cfg: RunConfig, budget: _StabilityBudget | None, scenario_id: str, reason: StabilityReason) -> _RetryRefusal | None:
     """Why this scenario does NOT get its second sample, or ``None`` when it may have one.
 
     Every branch returns the refusal FILED AGAINST THE SCENARIO, because that record is the
@@ -7737,7 +7786,7 @@ async def _replay_first_attempt(settings: Settings, *, first: ThreadResult, scen
 
 
 async def _drive_scenario_with_stability(
-    cfg: _RunConfig,
+    cfg: RunConfig,
     settings: Settings,
     sink: ObservabilitySink,
     *,
@@ -8082,7 +8131,7 @@ def _record_stability(
 
 
 async def _run_one(
-    cfg: _RunConfig,
+    cfg: RunConfig,
     settings: Settings,
     sink: ObservabilitySink,
     *,
@@ -8213,7 +8262,7 @@ async def _run_one(
 
 @_releases_finalize_hold
 async def _drive_one_scenario(
-    cfg: _RunConfig,
+    cfg: RunConfig,
     settings: Settings,
     sink: ObservabilitySink,
     *,
@@ -8790,7 +8839,7 @@ async def _drive_one_scenario(
 
 
 async def _gate_for_redrive(
-    cfg: _RunConfig,
+    cfg: RunConfig,
     settings: Settings,
     orch: Orchestrator,
     *,
@@ -8837,7 +8886,7 @@ async def _gate_for_redrive(
     return True
 
 
-async def _upload_datasets(cfg: _RunConfig, settings: Settings, sink: ObservabilitySink, *, scenario_ids: Sequence[str] | None = None) -> UploadResult | None:
+async def _upload_datasets(cfg: RunConfig, settings: Settings, sink: ObservabilitySink, *, scenario_ids: Sequence[str] | None = None) -> UploadResult | None:
     """Best-effort: fetch the set + upload it to the active client-side sink.
 
     Runs as a PRE-FLIGHT, before the gather — the dataset is the experiment's INPUT,
@@ -9039,7 +9088,7 @@ class _WorldSlots:
     from an EMPTY pool is a bug that raises — into that scenario's ``error.json`` — rather than waits.
 
     A ``threading.Lock``, not an asyncio primitive and not a ContextVar: it lives on
-    :class:`_RunConfig` so the experiment strategy's vendor-executor threads (which see neither the
+    :class:`RunConfig` so the experiment strategy's vendor-executor threads (which see neither the
     gathered loop nor its ContextVars) lease from the same pool.
     """
 
@@ -9072,8 +9121,9 @@ class _WorldSlots:
 
 
 @dataclass(frozen=True, slots=True)
-class _RunConfig:
-    """The CLI invocation's TYPED inputs — the raw ``argparse.Namespace`` never leaves ``main()``.
+class RunConfig:
+    """A run's TYPED inputs: the CLI invocation's, or a caller's that builds one directly (``plurai ci run``). The raw
+    ``argparse.Namespace`` never leaves ``main()``.
 
     :meth:`from_args` converts the parsed namespace ONCE into named, typed fields
     (paths are real ``Path``s), so helpers read ``cfg.agent_module_path`` instead of
@@ -9250,7 +9300,7 @@ class _RunConfig:
         return self.max_turns
 
     @classmethod
-    def from_args(cls, args: argparse.Namespace, *, mock_service_url: str | None = None) -> _RunConfig:
+    def from_args(cls, args: argparse.Namespace, *, mock_service_url: str | None = None) -> RunConfig:
         """The ONE Namespace→typed-fields conversion (argparse stays in main()).
 
         ``mock_service_url`` is the RESOLVED url (flag > env > ``.mock_service_url`` sidecar),
@@ -9337,7 +9387,7 @@ def _load_replay_plan(path: Path) -> tuple[frozenset[str], frozenset[str] | None
     return frozenset(single), frozenset(full), notes
 
 
-def _replay_plan_gaps(cfg: _RunConfig, scenario_ids: Sequence[str]) -> str | None:
+def _replay_plan_gaps(cfg: RunConfig, scenario_ids: Sequence[str]) -> str | None:
     """The one warning line for the recorded regressions this run plays whole WITHOUT a declaration saying so, else ``None``.
 
     A plan-routed full folder is a declaration, not a gap; a ``--replay-turn-only`` run plays every one at its cut.
@@ -9353,7 +9403,7 @@ def _replay_plan_gaps(cfg: _RunConfig, scenario_ids: Sequence[str]) -> str | Non
     return f'{len(undeclared)} recorded regression(s) are not in the replay plan and are played as whole conversations: {undeclared}'
 
 
-def _build_orchestrator(cfg: _RunConfig, settings: Settings, sink: ObservabilitySink) -> Orchestrator:
+def _build_orchestrator(cfg: RunConfig, settings: Settings, sink: ObservabilitySink) -> Orchestrator:
     """The ONE Orchestrator construction both run strategies share.
 
     Orchestrators are short-lived (one per scenario / one per setup step); the sink is
@@ -9978,7 +10028,7 @@ def _merge_run_links(first: RunLinks | None, second: RunLinks | None) -> RunLink
     )
 
 
-async def _read_run_scope(cfg: _RunConfig, settings: Settings) -> tuple[str, list[str]] | int:
+async def _read_run_scope(cfg: RunConfig, settings: Settings) -> tuple[str, list[str]] | int:
     """The run's ``(dataset name, scenario ids)`` once the backend has answered the scope read and the eval-set check, or the
     exit code of the stop the first read ended in: a credit refusal, an outage (the unavailable stop), or a refusal of the
     set. Both strategies read the same two things first, so an outage or refusal is one stop wherever it lands."""
@@ -10002,7 +10052,7 @@ async def _read_run_scope(cfg: _RunConfig, settings: Settings) -> tuple[str, lis
     return dataset_name, scenario_ids
 
 
-async def _resolve_run_scope(cfg: _RunConfig, settings: Settings) -> tuple[str, list[str]]:
+async def _resolve_run_scope(cfg: RunConfig, settings: Settings) -> tuple[str, list[str]]:
     """Resolve ``(dataset_name, scenario_ids)`` from ONE key-free ``GET /scenario-sets/{id}``.
 
     dataset_name — the backend set's human dataset name: the SAME name the
@@ -10058,13 +10108,13 @@ async def _resolve_run_scope(cfg: _RunConfig, settings: Settings) -> tuple[str, 
     return dataset_name, scenario_ids
 
 
-def _announce_replay_plan_gaps(cfg: _RunConfig, scenario_ids: Sequence[str]) -> None:
+def _announce_replay_plan_gaps(cfg: RunConfig, scenario_ids: Sequence[str]) -> None:
     """Print :func:`_replay_plan_gaps`' line once, when the run's scope is known; never a refusal."""
     if (gap := _replay_plan_gaps(cfg, scenario_ids)) is not None:
         print(f'[regressions] WARNING: {gap}', file=sys.stderr)
 
 
-async def _run_gathered_async(cfg: _RunConfig, settings: Settings, sink: ObservabilitySink) -> int:
+async def _run_gathered_async(cfg: RunConfig, settings: Settings, sink: ObservabilitySink) -> int:
     # A previous run's verdict must not survive an early guard exit below.
     _clear_stale_run_summary(cfg.out, partial=cfg.is_partial)
     # ...and neither must a previous IN-PROCESS run's accumulating ledgers (see
@@ -10191,7 +10241,7 @@ async def _run_gathered_async(cfg: _RunConfig, settings: Settings, sink: Observa
 
 
 async def _gather_run(
-    cfg: _RunConfig, settings: Settings, sink: ObservabilitySink, *, scenario_ids: list[str], dataset_name: str, run_name: str
+    cfg: RunConfig, settings: Settings, sink: ObservabilitySink, *, scenario_ids: list[str], dataset_name: str, run_name: str
 ) -> tuple[int, dict[str, Any]]:
     """ONE run's bounded gather over ``scenario_ids`` into ``cfg.out``: ``(failures, the rows)``.
 
@@ -10308,7 +10358,7 @@ async def _gather_run(
 
 
 def _write_gathered_summary(
-    cfg: _RunConfig, *, exit_code: int, run_name: str, rows: Mapping[str, Any], egress_dir: Path | None = None, aborted: Mapping[str, Any] | None = None
+    cfg: RunConfig, *, exit_code: int, run_name: str, rows: Mapping[str, Any], egress_dir: Path | None = None, aborted: Mapping[str, Any] | None = None
 ) -> _RunVerdict:
     """:func:`_write_run_summary` for one gathered run (:func:`_gather_run`'s rows) into ``cfg.out``."""
     return _write_run_summary(
@@ -10340,12 +10390,12 @@ def _write_gathered_summary(
     )
 
 
-def _trial_out(cfg: _RunConfig, index: int) -> Path:
+def _trial_out(cfg: RunConfig, index: int) -> Path:
     """Trial ``index``'s run directory: ``$OUT`` for trial 1, ``$OUT/trial_<index>`` otherwise."""
     return cfg.out / trial_dir_name(index)
 
 
-def _prepare_trial_dirs(cfg: _RunConfig) -> None:
+def _prepare_trial_dirs(cfg: RunConfig) -> None:
     """At strategy entry: clear each trial run's previous verdict the way ``$OUT``'s is cleared,
     and MOVE every ``trial_<k>`` directory this run will not write (``k > --trials``) under
     ``previous_attempt/``. Readers enumerate trials only from ``run_summary.trials.dirs``; a trial
@@ -10370,7 +10420,7 @@ def _prepare_trial_dirs(cfg: _RunConfig) -> None:
             print(f"[trials] WARNING: could not move the stale {path.name}/ aside ({exc}); it is NOT one of this run's trials.", file=sys.stderr)
 
 
-def _trials_out_refusal(cfg: _RunConfig) -> str | None:
+def _trials_out_refusal(cfg: RunConfig) -> str | None:
     """REFUSE a ``--scenario-id`` re-run whose ``--trials`` differs from the run it merges into.
 
     A targeted re-run is a correction to the population already in ``--out`` and merges into each
@@ -10419,7 +10469,7 @@ def _external_world_slots_line(slots: int, width: int, concurrency: int, *, owne
     return f'[world] {owner} world: up to {width} at once, one world copy each ({slots} slots{clamp})'
 
 
-def _one_at_a_time_for_world(cfg: _RunConfig, world_owner: tuple[str, Path] | None, world_slots: int | None = None) -> _RunConfig:
+def _one_at_a_time_for_world(cfg: RunConfig, world_owner: tuple[str, Path] | None, world_slots: int | None = None) -> RunConfig:
     """``cfg`` with every attempt bounded by the world copies when the bench declares ``world_state.owner: external``,
     or ``world_state.owner: agent`` beside a ``world_state.slots`` count.
 
@@ -10456,7 +10506,7 @@ def _one_at_a_time_for_world(cfg: _RunConfig, world_owner: tuple[str, Path] | No
     return dataclasses_replace(cfg, concurrency=width, one_at_a_time=True, world_slots=_WorldSlots(world_slots))
 
 
-def _one_at_a_time_for_single_instance(cfg: _RunConfig, resources: Sequence[str]) -> _RunConfig:
+def _one_at_a_time_for_single_instance(cfg: RunConfig, resources: Sequence[str]) -> RunConfig:
     """``cfg`` with ONE agent process at a time when the bench declares ``harness.single_instance`` resources
     (a fixed port the agent binds at setup, a lock it takes): two processes side by side would collide on it, and
     the second's setup fails for a reason that is ours, not the agent's. ``concurrency`` drops to 1 and the trials
@@ -10479,7 +10529,7 @@ def _single_instance_lease_line(resources: Sequence[str]) -> str:
     return f'[harness] single-instance resource ({", ".join(resources)}): held by one agent process at a time; the other scenarios and trials wait for it'
 
 
-def _lease_resources(cfg: _RunConfig, world_owner: tuple[str, Path] | None, world_slots: int | None, single_instance: Sequence[str]) -> _RunConfig:
+def _lease_resources(cfg: RunConfig, world_owner: tuple[str, Path] | None, world_slots: int | None, single_instance: Sequence[str]) -> RunConfig:
     """``cfg`` carrying one lease pool per exclusive resource, for the GATHERED strategy; ``concurrency`` and the trials
     are untouched (the experiment strategy keeps :func:`_one_at_a_time_for_world` and
     :func:`_one_at_a_time_for_single_instance` instead).
@@ -10503,12 +10553,12 @@ def _lease_resources(cfg: _RunConfig, world_owner: tuple[str, Path] | None, worl
     return dataclasses_replace(cfg, resource_leases=tuple(specs)) if specs else cfg
 
 
-def _alive_cap(cfg: _RunConfig) -> int | None:
+def _alive_cap(cfg: RunConfig) -> int | None:
     """At most how many agent processes a gathered run's leases let live at once (the fewest copies), ``None`` with none."""
     return min((spec.copies for spec in cfg.resource_leases), default=None)
 
 
-def _sibling_width(cfg: _RunConfig) -> int:
+def _sibling_width(cfg: RunConfig) -> int:
     """How many agent processes may have run beside an attempt's, for the re-drive rules that ask whether a sibling
     could have taken its memory: ``--concurrency``, but 1 under a one-copy lease, where no sibling process lives."""
     return 1 if _alive_cap(cfg) == 1 else cfg.concurrency
@@ -10547,7 +10597,7 @@ def _memory_limit_mb(root: Path = _CGROUP_ROOT) -> int | None:
     return None
 
 
-def _trials_in_turn_for_memory(cfg: _RunConfig, limit_mb: int | None) -> _RunConfig:
+def _trials_in_turn_for_memory(cfg: RunConfig, limit_mb: int | None) -> RunConfig:
     """``cfg`` with its trials run one after another when ``trials × concurrency`` agent processes do
     not fit the known memory limit (``T·C·_CHILD_MB > limit − _RESERVE_MB``); otherwise ``cfg`` itself.
 
@@ -10568,7 +10618,7 @@ def _trials_in_turn_for_memory(cfg: _RunConfig, limit_mb: int | None) -> _RunCon
     return dataclasses_replace(cfg, one_at_a_time=True)
 
 
-async def _run_trials(cfg: _RunConfig, settings: Settings, *, scenario_ids: list[str], dataset_name: str, run_name: str, upload_ok: bool) -> list[int | None]:
+async def _run_trials(cfg: RunConfig, settings: Settings, *, scenario_ids: list[str], dataset_name: str, run_name: str, upload_ok: bool) -> list[int | None]:
     """Run the set ``cfg.trials`` times, CONCURRENTLY, as that many complete runs; their exit codes,
     ``None`` for a trial that raised outside its scenarios (it wrote no summary of this run).
 
@@ -10639,7 +10689,7 @@ def _setup_failures(run_dir: Path, scenario_ids: Sequence[str]) -> list[str]:
 
 
 async def _rerun_setup_collisions(
-    cfg: _RunConfig,
+    cfg: RunConfig,
     settings: Settings,
     settled: list[tuple[int, _RunVerdict, RunLinks | None] | BaseException],
     *,
@@ -10666,7 +10716,7 @@ async def _rerun_setup_collisions(
 
 
 async def _run_trial(
-    cfg: _RunConfig, settings: Settings, *, index: int, scenario_ids: list[str], dataset_name: str, run_name: str, upload_ok: bool
+    cfg: RunConfig, settings: Settings, *, index: int, scenario_ids: list[str], dataset_name: str, run_name: str, upload_ok: bool
 ) -> tuple[int, _RunVerdict, RunLinks | None]:
     """Trial ``index``: one complete run into :func:`_trial_out`, under its own sink, run name
     (``<run>-t<index>``) and per-row ledgers; returns its exit code, verdict and run links, which
@@ -10856,7 +10906,7 @@ def _union_host_effects(blocks: Iterable[Any]) -> dict[str, Any]:
     }
 
 
-def _publish_trials(cfg: _RunConfig, *, run_name: str, scenario_ids: Sequence[str], trial_codes: Sequence[int | None], dataset_url: str | None) -> int:
+def _publish_trials(cfg: RunConfig, *, run_name: str, scenario_ids: Sequence[str], trial_codes: Sequence[int | None], dataset_url: str | None) -> int:
     """Compose ``$OUT/run_summary.json`` for a ``--trials N`` run and publish ``.last_run`` once;
     returns the run's exit code — the WORST trial's (the highest registry code, so a fault outranks a failed policy).
 
@@ -11005,7 +11055,7 @@ def _print_trials(block: Mapping[str, Any], *, dataset_url: str | None, host_too
 
 
 def _make_task_runner(
-    cfg: _RunConfig,
+    cfg: RunConfig,
     settings: Settings,
     sink: ObservabilitySink,
     *,
@@ -11108,7 +11158,7 @@ def _make_task_runner(
     return run_one
 
 
-def _unique_run_name(cfg: _RunConfig, *, base: str | None = None) -> str:
+def _unique_run_name(cfg: RunConfig, *, base: str | None = None) -> str:
     """A unique per-invocation experiment/run handle.
 
     Explicit ``--run-name`` (or ``$PLURAI_EXPERIMENT_RUN_NAME``) wins; otherwise stamp
@@ -11126,7 +11176,7 @@ def _unique_run_name(cfg: _RunConfig, *, base: str | None = None) -> str:
 
 
 async def _setup_experiment(
-    cfg: _RunConfig, settings: Settings, sink: ObservabilitySink, *, scenario_ids: Sequence[str] | None = None
+    cfg: RunConfig, settings: Settings, sink: ObservabilitySink, *, scenario_ids: Sequence[str] | None = None
 ) -> tuple[dict[str, Any], list[str]] | None:
     """Warm the sink, UPLOAD the dataset FIRST, and resolve per-policy eval names.
 
@@ -11183,7 +11233,7 @@ async def _setup_experiment(
     return load_upload_metadata(cfg.out), policy_names
 
 
-def _run_as_experiment(cfg: _RunConfig, settings: Settings, sink: _ExperimentSink) -> int:
+def _run_as_experiment(cfg: RunConfig, settings: Settings, sink: _ExperimentSink) -> int:
     """The experiment strategy: the sink's vendor SDK drives the whole scenario set.
 
     Async setup (warm + upload + policy fetch) runs under its own ``asyncio.run``; then
@@ -11513,7 +11563,7 @@ def _read_sidecar(agent_module_path: Path | None, name: str) -> str | None:
     return raw.strip()
 
 
-def _publish_run_pointer(cfg: _RunConfig, out: Path) -> None:
+def _publish_run_pointer(cfg: RunConfig, out: Path) -> None:
     """Point the workspace at the run this invocation just finalised: write ``.last_run``.
 
     The runner is the only party that knows BOTH that a run finalised and where it wrote, so it
@@ -11524,7 +11574,7 @@ def _publish_run_pointer(cfg: _RunConfig, out: Path) -> None:
     scratch run overwrite the real workspace's pointer with a path under a temp dir.
 
     ABSOLUTE, because the reader is a later shell with a cwd of its own: ``--out runs/out-A`` is
-    kept verbatim by :meth:`_RunConfig.from_args`, and a relative pointer silently resolves
+    kept verbatim by :meth:`RunConfig.from_args`, and a relative pointer silently resolves
     against whatever directory the next command happens to run in.
 
     ATOMIC, on the :func:`_write_json` convention — a torn pointer reads as the empty string,
@@ -11870,6 +11920,23 @@ def _settings_from_args(args: argparse.Namespace) -> Settings:
     print(f'[turn-timeout] {net.agent_turn_timeout:.0f}s ({turn_timeout_source})')
     _announce_scenario_budget(net)
     return _apply_observability_posture(settings, args)
+
+
+def settings_for_run(endpoint: Endpoint, *, mock_service_url: str | None, run_phase: RunPhase = 'full') -> Settings:
+    """The settings of a run a caller builds without the command line: ``endpoint``'s backend and bearer, the deployed mock at
+    ``mock_service_url`` in ``connect`` posture, the phase's own time budgets, and every observability sink off.
+
+    No sidecar file beside the harness and no flag is read: what the caller passes is what the run uses.
+    """
+    base = Settings().with_endpoint(endpoint)
+    update: dict[str, object] = {
+        'mock_mode': 'connect',
+        'mock_service_url': mock_service_url,
+        'agent_turn_timeout': default_agent_turn_timeout(run_phase),
+        'scenario_timeout': default_scenario_time_budget(run_phase),
+    }
+    net = NetworkSettings(**{**base.network.model_dump(), **update})
+    return _with_observability_off(base.model_copy(update={'network': net}))
 
 
 def _announce_scenario_budget(net: NetworkSettings) -> None:
@@ -12337,7 +12404,7 @@ def _trial_count(raw: str) -> int:
     return value
 
 
-def _trials_refusal(cfg: _RunConfig) -> str | None:
+def _trials_refusal(cfg: RunConfig) -> str | None:
     """Why this invocation cannot take ``--trials N`` for N >= 2, with its one remedy; else ``None``."""
     if cfg.trials < 2:
         return None
@@ -12351,7 +12418,7 @@ def _trials_refusal(cfg: _RunConfig) -> str | None:
     return None
 
 
-def _replay_turn_only_refusal(cfg: _RunConfig) -> str | None:
+def _replay_turn_only_refusal(cfg: RunConfig) -> str | None:
     """Why this invocation cannot take ``--replay-turn-only``, with its one remedy; else ``None``.
 
     A single-hop replay runs ONLY the regression folders it names, and nothing may re-run one of them
@@ -12731,12 +12798,23 @@ def _main(argv: list[str] | None) -> int:
 
 
 def _main_body(args: argparse.Namespace) -> int:
-    """:func:`main` once its gate-authority invocation is open (see :mod:`plurai.gates.invocation`).
+    """:func:`main` once its gate-authority invocation is open (see :mod:`plurai.gates.invocation`)."""
+    settings = _settings_from_args(args)
+    cfg = RunConfig.from_args(args, mock_service_url=settings.network.mock_service_url)
+    return run_suite(cfg, settings, mock_pin_source=_mock_url_pin_source(args, settings))
+
+
+def run_suite(cfg: RunConfig, settings: Settings, *, mock_pin_source: str | None = None) -> int:
+    """Run the scenarios ``cfg`` names against the backend ``settings`` points at, and return the run's exit code.
+
+    The public entry of a run, below the command line: everything :func:`main` does once its arguments are typed. Needs an open
+    gate-authority invocation (:func:`plurai.gates.invocation.run_invocation`); ``main`` opens one, and a caller that does not
+    come through ``main`` opens its own. Artifacts land in ``cfg.out``. ``mock_pin_source`` names the rung that pinned
+    ``cfg.mock_service_url`` (an explicit pin refuses a run whose mock does not answer; see :func:`_preflight_mock_service`).
 
     The gate record is CLAIMED below, once this run owns ``--out``: every rung above that point
     leaves the directory exactly as it found it, so none of them writes a record there.
     """
-    settings = _settings_from_args(args)
     gates = current_gate_authority()
     # Liveness, then this run's own credentials against a bearer-gated route, in ONE slot covering both
     # dispatch strategies below (the experiment path does even more up-front work — scope resolution +
@@ -12763,15 +12841,16 @@ def _main_body(args: argparse.Namespace) -> int:
     # _preflight_mock_service — it fires only for a workspace that PINNED a url, and what it
     # DOES about an unreachable one depends on which rung pinned it (a stale sidecar is dropped
     # with a warning, an explicit flag or env var is refused). It may hand back settings with the
-    # pin removed, so the rest of main() reads what it returned, not what went in.
+    # pin removed, so the rest of the run reads what it returned, not what went in. A backend that never answered has no
+    # mock to ask about either.
     mock_finding = None
     if outage is None:
-        settings, mock_finding = _preflight_mock_service(settings, pin_source=_mock_url_pin_source(args, settings))
+        settings, mock_finding = _preflight_mock_service(settings, pin_source=mock_pin_source)
     if mock_finding is not None:
         gates.emit(mock_finding)
         if (code := _invariant_exit(None)) is not None:
             return code
-    cfg = _RunConfig.from_args(args, mock_service_url=settings.network.mock_service_url)
+    cfg = dataclasses_replace(cfg, mock_service_url=settings.network.mock_service_url)
     # Before --out is touched: the --trials postures that cannot take N samples (qualification, replay).
     if (trials_message := _trials_refusal(cfg)) is not None:
         print(f'ERROR: {trials_message}', file=sys.stderr)

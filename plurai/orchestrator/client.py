@@ -13,6 +13,7 @@ import httpx
 from pydantic import Field
 
 from plurai import _http, command_run
+from plurai.orchestrator import thread_log
 from plurai._endpoints import bearer_for_origin, resolve_document_reference, resolve_server_relative
 from plurai._protocol import QUARANTINE_REFUSAL_PREFIX, OrchestratorAdapterError, ScenarioQuarantined
 from plurai.content_parts import document_part_values
@@ -281,6 +282,7 @@ class OrchestratorClient:
         api_key: str | None = None,
         retry: RetryConfig | None = None,
         command_run_id: str | None = None,
+        transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         headers: dict[str, str] = {'Content-Type': 'application/json'}
         if api_key:
@@ -302,11 +304,8 @@ class OrchestratorClient:
         # slow).
         self._base_url = base_url.rstrip('/')
         self._api_key = api_key or None
-        self._client = _http.AsyncClient(
-            base_url=self._base_url,
-            timeout=httpx.Timeout(timeout, connect=min(10.0, timeout)),
-            headers=headers,
-        )
+        http_timeout = httpx.Timeout(timeout, connect=min(10.0, timeout))
+        self._client = _http.AsyncClient(base_url=self._base_url, timeout=http_timeout, headers=headers, transport=transport)
         self._retry = retry if retry is not None else RetryConfig()
         # The client's timeouts with the read timeout cut to FINALIZE_POLL_READ_TIMEOUT_SECONDS (never raised above the client's own).
         base = self._client.timeout
@@ -334,9 +333,11 @@ class OrchestratorClient:
         """Drop what the client holds for the thread: its served documents, which are up to several MB each.
 
         The caller releases a thread once nothing reads its served documents any more; one client serves
-        every scenario of a run, so an unreleased thread holds its documents until the run ends.
+        every scenario of a run, so an unreleased thread holds its documents until the run ends. A released thread is also noted
+        closed in the thread log: nothing is left to cancel on it.
         """
         self._served.pop(thread_id, None)
+        thread_log.note_closed(thread_id)
 
     async def __aenter__(self) -> OrchestratorClient:
         return self
@@ -401,6 +402,7 @@ class OrchestratorClient:
                 raise ScenarioQuarantined(detail, scenario_id=scenario_id) from exc
             raise
         thread = CreateThreadResponse.model_validate(response.json())
+        thread_log.note_opened(thread.thread_id)
         try:
             return await self._resolve_server_paths(thread)
         except BaseException:

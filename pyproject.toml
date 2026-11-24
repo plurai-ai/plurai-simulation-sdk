@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "plurai-simulation-sdk"
-version = "1.0.7"
+version = "1.1.0"
 description = "Simulate conversations against your AI agent and score it on your policies."
 readme = "README.md"
 license = {text = "Proprietary"}
@@ -79,17 +79,17 @@ arize = [
 braintrust = ["braintrust>=0.24.0"]
 # Client-side corpus extraction (`plurai.rag_extract`, `plurai ingest-corpus`). Per-source drivers layer
 # on top as the `extract-<driver>` extras below.
-extract = ["plurai-extract==1.0.2"]
+extract = ["plurai-extract==1.0.3"]
 # One extra per source driver of plurai-extract, pinned to the same release as `extract`: `plurai-simulation-sdk[extract-pdf]`.
-extract-pdf = ["plurai-extract[pdf]==1.0.2"]
-extract-http = ["plurai-extract[http]==1.0.2"]
-extract-vertex = ["plurai-extract[vertex]==1.0.2"]
-extract-bigquery = ["plurai-extract[bigquery]==1.0.2"]
-extract-redshift = ["plurai-extract[redshift]==1.0.2"]
-extract-azure-sql = ["plurai-extract[azure-sql]==1.0.2"]
-extract-databricks = ["plurai-extract[databricks]==1.0.2"]
-extract-snowflake = ["plurai-extract[snowflake]==1.0.2"]
-extract-bedrock = ["plurai-extract[bedrock]==1.0.2"]
+extract-pdf = ["plurai-extract[pdf]==1.0.3"]
+extract-http = ["plurai-extract[http]==1.0.3"]
+extract-vertex = ["plurai-extract[vertex]==1.0.3"]
+extract-bigquery = ["plurai-extract[bigquery]==1.0.3"]
+extract-redshift = ["plurai-extract[redshift]==1.0.3"]
+extract-azure-sql = ["plurai-extract[azure-sql]==1.0.3"]
+extract-databricks = ["plurai-extract[databricks]==1.0.3"]
+extract-snowflake = ["plurai-extract[snowflake]==1.0.3"]
+extract-bedrock = ["plurai-extract[bedrock]==1.0.3"]
 # Document readers the generated harness (simulate.py) previews agent output with. Bare `markitdown` ships no format readers (without `mammoth`
 # every .docx reads as unmeasurable); the extras are the readers: mammoth, python-pptx, openpyxl, pdfminer.six. `plurai.file_rows` imports
 # openpyxl and python-pptx directly.

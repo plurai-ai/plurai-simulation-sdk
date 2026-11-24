@@ -200,11 +200,7 @@ class AgentIO:
             INPUT_FIELD: list(self.input_parts),
             MAY_OPEN_FIELD: self.may_open,
             **({OPENS_FIELD: self.opens} if self.opens is not None else {}),
-            **(
-                {CHOICE_TEXT_FIELD: dict(self.choice_text), CHOICE_TEXT_SOURCE_FIELD: self.choice_text_source}
-                if self.choice_text is not None
-                else {}
-            ),
+            **({CHOICE_TEXT_FIELD: dict(self.choice_text), CHOICE_TEXT_SOURCE_FIELD: self.choice_text_source} if self.choice_text is not None else {}),
             **({CHANNELS_FIELD: [channel.as_record() for channel in self.channels]} if self.channels else {}),
             'source': str(self.source) if self.source is not None else None,
         }
@@ -329,9 +325,7 @@ def _parse_choice_text(raw: Mapping[str, Any], *, where: str) -> tuple[Mapping[s
         if not isinstance(choice, str) or not choice.strip():
             raise AgentIOConfigError(f'{where}`{AGENT_IO_KEY}.{CHOICE_TEXT_FIELD}` keys must be non-blank choice spellings, got {choice!r}.')
         if verdict not in CHOICE_TEXT_VALUES:
-            raise AgentIOConfigError(
-                f'{where}`{AGENT_IO_KEY}.{CHOICE_TEXT_FIELD}.{choice}` must be one of {list(CHOICE_TEXT_VALUES)}, got {verdict!r}.'
-            )
+            raise AgentIOConfigError(f'{where}`{AGENT_IO_KEY}.{CHOICE_TEXT_FIELD}.{choice}` must be one of {list(CHOICE_TEXT_VALUES)}, got {verdict!r}.')
         facts[choice] = str(verdict)
     if not isinstance(source, str) or not source.strip():
         raise AgentIOConfigError(

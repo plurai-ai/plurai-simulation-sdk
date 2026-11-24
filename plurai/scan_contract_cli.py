@@ -79,10 +79,7 @@ must not add dependencies to an SDK install that a customer never asked for.
 from __future__ import annotations
 
 import argparse
-import contextlib
 import json
-import os
-import secrets
 import sys
 import traceback
 from collections.abc import Sequence
@@ -93,6 +90,7 @@ from typing import Any
 import yaml
 
 from plurai import exit_codes
+from plurai.atomic_write import write_atomic
 from plurai import readers
 from plurai._platform import utf8_stdio
 from plurai.gates.catalogue import UnknownGateError
@@ -156,18 +154,7 @@ def _atomic_write_text(path: Path, text: str) -> None:
     ``files`` list, and every dropped file then reads as ``removed`` in the next DriftReport.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    # Same-directory tmp + replace, and the tmp name is unique PER WRITER so two writers cannot
-    # rename each other's half-written file away. NOT fsynced and NOT mkstemp: the 0644 default
-    # mode is what a later reader (a different user, a CI step) needs — mkstemp's 0600 would make
-    # the baseline unreadable to them.
-    tmp = path.with_name(f'.{path.name}.{os.getpid()}-{secrets.token_hex(4)}.tmp')
-    try:
-        tmp.write_text(text, encoding='utf-8')
-        tmp.replace(path)
-    except BaseException:
-        with contextlib.suppress(OSError):
-            tmp.unlink()
-        raise
+    write_atomic(path, text)
 
 
 @dataclass(frozen=True, slots=True)

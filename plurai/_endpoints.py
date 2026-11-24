@@ -29,14 +29,16 @@ This module is also the SDK's ONE resolver of which backend a process talks to a
 token (:func:`resolve`). The answer is one atomic :class:`Endpoint`, ``(url, token, source)``:
 
 * the environment pair, ``PLURAI_URL`` with ``PLURAI_TOKEN``; else
+* ``PLURAI_TOKEN`` alone, sent to production, the api root ``plurai login`` signs in to; else
 * ``PLURAI_URL`` alone with the credentials file's token, when the file's url is that same backend; else
 * the credentials file pair (:mod:`plurai.credentials`, written by ``plurai login``).
 
-There is no default backend and no third source: a ``.env`` file never names the backend. A
-configuration that takes its url from one source and its token from the other is an error rather
-than a guess, because a token sent to a url it was not issued for is a leaked token. ``PLURAI_URL``
-naming the saved login's own backend is no such mix: the token goes to the url it was issued for. Loopback is
-the one tokenless case: ``PLURAI_URL`` naming a loopback address needs no ``PLURAI_TOKEN``.
+Production is the backend whenever ``PLURAI_URL`` is unset and a token is given; ``PLURAI_URL`` is for a backend other than
+production. There is no third source: a ``.env`` file never names the backend. A configuration that takes its url from one
+source and its token from the other is an error rather than a guess, because a token sent to a url it was not issued for is
+a leaked token. ``PLURAI_URL`` naming the saved login's own backend is no such mix: the token goes to the url it was issued
+for. The saved login's url is never combined with an environment token. Loopback is the one tokenless case: ``PLURAI_URL``
+naming a loopback address needs no ``PLURAI_TOKEN``.
 
 The bearer travels only to the resolved origin, exactly: scheme, host and port (:meth:`Endpoint.bearer_for`), so a
 mock url, a pinned redirect or a url a model wrote into a file cannot collect it.
@@ -48,6 +50,7 @@ optional dependencies.
 from __future__ import annotations
 
 import os
+import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Final, Literal
@@ -148,15 +151,15 @@ TERMS_URL: Final = 'https://github.com/plurai-ai/plurai-simulation#terms-and-pri
 
 #: What a user without any configuration is told.
 MISSING_CONFIGURATION_MESSAGE: Final = (
-    'Plurai is not configured: PLURAI_URL and PLURAI_TOKEN are not set and there is no saved login.\n'
+    'Plurai is not configured: PLURAI_TOKEN is not set and there is no saved login.\n'
     'Sign up in the Plurai dashboard, or on the sign-in page the login opens.\n'
     f'Signing up accepts the Terms of Service and the Privacy Policy, linked at {TERMS_URL}\n'
     "Log in once with the plugin's setup skill (/harness-setup), or in a terminal with: plurai login (it opens the browser)\n"
-    'Otherwise export PLURAI_URL and PLURAI_TOKEN, with a key from the Plurai dashboard, in the environment that launches this command.'
+    'Otherwise export PLURAI_TOKEN, with a key from the Plurai dashboard, in the environment that launches this command.'
 )
 
 #: How a failed bearer is fixed, for the lines that report a refused token.
-CREDENTIAL_FIX: Final = 'run `plurai logout` and then `plurai login`, or export PLURAI_URL and PLURAI_TOKEN'
+CREDENTIAL_FIX: Final = 'run `plurai logout` and then `plurai login`, or export PLURAI_TOKEN (with PLURAI_URL for a backend other than production)'
 
 Source = Literal['environment', 'credentials file']
 
@@ -245,12 +248,42 @@ def _environment_url(text: str) -> str:
     return diagnostic_base(text)
 
 
+def _production_root() -> str:
+    """The api root of production, read from the table ``plurai login`` signs in through so the two cannot differ.
+
+    Imported here because :mod:`plurai.login` imports this module.
+    """
+    from plurai.login import _environments  # noqa: PLC0415 - the login package imports this module at load time
+
+    return diagnostic_base(_environments.default().api_root)
+
+
+#: The targets already announced in this process, so a resolver called for every request says it once.
+_ANNOUNCED: set[str] = set()
+
+
+def _announce_production(root: str, env: Mapping[str, str]) -> None:
+    """One stderr line when a token alone goes to production although a saved login names another backend: the token is the
+    environment's and the login is the person's, and which of them wins is not what a reader of a log would guess."""
+    if root in _ANNOUNCED or credentials.home_problem(env):
+        return
+    saved = credentials.read()
+    if saved.problem or not saved.token or diagnostic_base(saved.url) == root:
+        return
+    _ANNOUNCED.add(root)
+    print(
+        f'plurai: {TOKEN_ENV} is set without {URL_ENV}, so requests go to {root}, not to the backend of the saved login '
+        f'({diagnostic_base(saved.url)}). Set {URL_ENV} to use another backend.',
+        file=sys.stderr,
+    )
+
+
 def resolve(env: Mapping[str, str] | None = None) -> Endpoint:
-    """The backend ``env`` (default ``os.environ``) names: the environment pair, else the saved login.
+    """The backend ``env`` (default ``os.environ``) names: the environment pair, else a token alone against production, else the saved login.
 
     Raises:
         NotConfiguredError: neither source names a backend (the message is :data:`MISSING_CONFIGURATION_MESSAGE`).
-        PartialConfigurationError: one half of the pair is set without the other.
+        PartialConfigurationError: ``PLURAI_URL`` is set without a token for a backend that is not on this machine.
         SavedLoginError: the credentials file is unusable.
         EndpointError: ``PLURAI_URL`` is not a usable url.
     """
@@ -273,11 +306,9 @@ def resolve(env: Mapping[str, str] | None = None) -> Endpoint:
             f'{TOKEN_ENV}, or unset {URL_ENV} to use the saved login (`plurai login --status`).'
         )
     if token:
-        raise PartialConfigurationError(
-            f'Plurai is partly configured: {TOKEN_ENV} is set but {URL_ENV} is not. A token is only sent to the backend it was issued for, '
-            f'so the url of a saved login is not combined with it. Set both {URL_ENV} and {TOKEN_ENV}, '
-            f'or unset {TOKEN_ENV} to use the saved login (`plurai login --status`).'
-        )
+        root = _production_root()
+        _announce_production(root, environment)
+        return Endpoint(root, token, 'environment')
     if moved := credentials.home_problem(environment):
         raise NotConfiguredError(f'{moved}\n{MISSING_CONFIGURATION_MESSAGE}')
     saved = credentials.read()

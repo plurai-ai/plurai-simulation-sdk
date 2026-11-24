@@ -2,7 +2,7 @@
 
 ``X-Plurai-Client`` is a default header of the client itself, set after the caller's client-level headers, so it reaches
 the wire on every request of every call site whatever headers the call site configures. ``User-Agent`` names the SDK the
-same way unless the caller already set one. Open clients here and nowhere else;
+same way unless the caller already set one. ``X-Plurai-Run-Origin`` is added the same way when the process is a CI run. Open clients here and nowhere else;
 ``tests/test_client_handshake_transport.py`` fails on a client opened any other way.
 """
 
@@ -12,7 +12,7 @@ from typing import Any
 
 import httpx
 
-from plurai import client_handshake
+from plurai import client_handshake, run_origin
 
 
 def _stamped(headers: Any) -> httpx.Headers:  # noqa: ANN401 - any shape httpx takes for ``headers``
@@ -20,6 +20,8 @@ def _stamped(headers: Any) -> httpx.Headers:  # noqa: ANN401 - any shape httpx t
     merged[client_handshake.HEADER] = client_handshake.header_value()
     if client_handshake.USER_AGENT_HEADER not in merged:
         merged[client_handshake.USER_AGENT_HEADER] = client_handshake.user_agent()
+    if (origin := run_origin.current()) is not None:
+        merged[run_origin.HEADER] = origin
     return merged
 
 

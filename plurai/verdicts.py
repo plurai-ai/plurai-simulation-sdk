@@ -40,7 +40,6 @@ from __future__ import annotations
 import argparse
 import copy
 import json
-import os
 import sys
 from collections.abc import Mapping
 from datetime import UTC, datetime
@@ -50,6 +49,7 @@ from typing import Any, Final, Literal, NamedTuple, get_args
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from plurai import exit_codes
+from plurai.atomic_write import write_atomic
 from plurai._protocol import AGENT_RAISED_KIND, AGENT_RECURSION_BUDGET_KIND
 from plurai.observability.scenario_verdict import GOAL_SOURCE_NONE, VERDICT_KEY, _unwrap
 from plurai.run_artifacts import STABILITY_RETRY_DIRNAME, VERDICTS_FILENAME
@@ -548,13 +548,11 @@ def _validated(doc: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _write(item_dir: Path, doc: Mapping[str, Any]) -> dict[str, Any]:
-    """Validate, then write atomically (a sibling temp, then ``os.replace``): a reader sees the whole old file or the whole new one."""
+    """Validate, then write atomically: a reader sees the whole old file or the whole new one."""
     valid = _validated(doc)
     target = path_of(item_dir)
     target.parent.mkdir(parents=True, exist_ok=True)
-    tmp = target.with_name(f'{target.name}.{os.getpid()}.tmp')
-    tmp.write_text(json.dumps(valid, indent=2, ensure_ascii=False, default=str), encoding='utf-8')
-    tmp.replace(target)
+    write_atomic(target, json.dumps(valid, indent=2, ensure_ascii=False, default=str))
     return valid
 
 

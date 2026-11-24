@@ -155,6 +155,7 @@ from plurai.orchestrator._retry import NetworkRefused
 from plurai.orchestrator.local_paths import LOCAL_PATH_MARKER
 from plurai.orchestrator.state_wire import scrub_run_info_paths
 from plurai import readers, scoring, verdicts
+from plurai.ci import cli as ci_cli
 from plurai.rag_extract import CorpusExtractionDependencyError, CorpusRootsError, CorpusScopeError
 from plurai.run_artifacts import (
     CLI_SESSION_DIRNAME,
@@ -3563,6 +3564,8 @@ def build_parser() -> argparse.ArgumentParser:
     verdicts.add_parser(sub, path_type=expand_user_path)
     # THE scores block (run_summary.json → scores), recomputed from those files after every verdicts write.
     scoring.add_parser(sub, path_type=expand_user_path)
+    # The CI commands: `ci run`, `ci validate`, `ci token` and `suite diff`.
+    ci_cli.add_parsers(sub)
 
     # One spelling of the flag on every subcommand that converts or publishes input; the two that
     # only read (capabilities, folder-names) gate nothing.
@@ -3777,7 +3780,14 @@ def _main(argv: list[str] | None) -> int:
     if tokens[:1] == ['logout']:
         return login_commands.main_logout(tokens[1:])
     parser = build_parser()
-    args = parser.parse_args(tokens)
+    try:
+        args = parser.parse_args(tokens)
+    except SystemExit as stopped:
+        # The CI commands keep to their own codes (`ci run` exits 0, 1, 10, 20, 65 or 77; `ci token` adds 17, 69 and 75), and 64 is
+        # not one of them: a bad command line is a refusal (65), with argparse's message already printed.
+        if stopped.code == exit_codes.USAGE and tokens[:1] in ci_cli.COMMANDS:
+            return exit_codes.REFUSED
+        raise
     if not hasattr(args, 'overrule'):
         return _run_command(args)
     # Read before the command runs: a malformed overrule file refuses it rather than reading as

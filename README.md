@@ -42,8 +42,8 @@ install only what you use.
    plurai login --status
    ```
 
-   On a machine with no browser, or for a backend the login does not know, export `PLURAI_URL` and `PLURAI_TOKEN`
-   (a key made in the dashboard) instead.
+   On a machine with no browser, or for a backend the login does not know, export `PLURAI_TOKEN` (a key made in the
+   dashboard) instead. Set `PLURAI_URL` as well for a backend other than production.
 
    `plurai logout` revokes the saved key at the backend and removes the credentials file. When the backend cannot be
    reached it keeps the file and exits 75, so you can run it again; when no retry can help it removes the file, names
@@ -69,13 +69,15 @@ If you have the Claude Code plugin, its `/simulate` command does steps 1 to 3 fo
 
 ## Authentication
 
-Every command resolves its backend the same way. There is no default backend, and no `--server-url` or `--token` flag:
+Every command resolves its backend the same way. The backend is production unless `PLURAI_URL` names another one, and
+there is no `--server-url` or `--token` flag:
 
-1. `PLURAI_URL` together with `PLURAI_TOKEN` from the environment, else
+1. `PLURAI_TOKEN` from the environment, with `PLURAI_URL` when the key belongs to a backend other than production
+   (production when it is unset), else
 2. the pair saved by `plurai login` in `~/.plurai/credentials.json`.
 
-The pair is taken whole from one source. A url from one source with the token from the other is an error, because a
-token must only reach the backend it was issued for. `PLURAI_URL` must be `https`; plain `http` is accepted only for a
+A url from one source with the token from the other is an error, because a token must only reach the backend it was
+issued for; an environment token is never sent to the url of the saved login. `PLURAI_URL` must be `https`; plain `http` is accepted only for a
 loopback address, which needs no token. A `.env` file is not a source. The token is sent only to the resolved origin
 (scheme, host and port), so a mock url on another host or on another local port never receives it. With nothing
 configured, a command prints how to sign up and log in instead of trying to connect.
@@ -85,7 +87,7 @@ names when that is one the SDK knows; any other host is refused. When only `PLUR
 but every other command refuses that configuration until `PLURAI_URL` is unset or `PLURAI_TOKEN` is exported too. With
 `PLURAI_TOKEN` set it refuses, because the environment pair is what every command uses, and with a usable saved key for the same backend it does nothing. A login that overwrites a saved key revokes it with its own key once the
 new key is saved, and warns when it cannot; keys made in the dashboard are never touched. It never keeps the sign-in's own
-tokens: the refresh token is revoked once the key is saved, or when the key could not be created. CI and other machines without a browser use `PLURAI_URL` and `PLURAI_TOKEN`, or a
+tokens: the refresh token is revoked once the key is saved, or when the key could not be created. CI and other machines without a browser use `PLURAI_TOKEN` (and `PLURAI_URL` for a backend other than production), or a
 credentials file written elsewhere. The credentials file is readable by anything that runs as you, a shell an agent runs
 included. Revoke a key in the dashboard; deleting the file only forgets it.
 
@@ -207,6 +209,14 @@ Everything else is an implementation detail and may change in any release. The f
 All three command lines exit with the same table. A code means one thing everywhere, and a command uses only the rows
 that apply to it. 2 is never returned: it is the status of a bad command line in most tools, and here that is 64.
 
+The CI commands (`plurai ci` and `plurai suite`) differ in three exits, so a CI step reads one set of codes:
+
+- A bad command line exits 65 (`REFUSED`), not 64.
+- Ctrl-C (or SIGTERM) ends `plurai ci run` with 20 after it cancels its open threads and writes the partial reports, not
+  with 130.
+- Ctrl-C ends `plurai ci token` with 1, not 130, after it revokes a key it made. The command checks no policy, so the 1
+  says only that it did not finish.
+
 | Code | Name | Meaning |
 | --- | --- | --- |
 | 0 | `OK` | done; everything checked held |
@@ -222,14 +232,14 @@ that apply to it. 2 is never returned: it is the status of a bad command line in
 | 18 | `SCAN_HELD` | `plurai-scan-contract` verified the sources and a finding holds the flow |
 | 19 | `REQUIREMENT_GAP` | `python -m plurai.host_toolchain` measured a gap on the host |
 | 20 | `NOT_MEASURED` | a command that checks policies could not measure them: an infrastructure error, a suite fault or no credit; the report names the cause |
-| 64 | `USAGE` | bad command line |
+| 64 | `USAGE` | bad command line (65 for `plurai ci` and `plurai suite`) |
 | 65 | `REFUSED` | declined to proceed: a gate holds the run, or the input or platform is unusable |
 | 66 | `INPUT_UNREADABLE` | a local input file is missing, empty or unreadable |
 | 69 | `TRANSPORT` | the backend or the mock was unreachable or gave an unusable answer |
 | 70 | `INTERNAL_FAULT` | a defect in the SDK; nothing was concluded |
 | 75 | `TEMPFAIL` | temporary: the sign-in timed out or a server asked to retry later (HTTP 429); run the command again later |
 | 77 | `CREDENTIALS` | no usable credential, or the backend rejected the token |
-| 130 | `INTERRUPTED` | the user interrupted the command (Ctrl-C); a run keeps the per-scenario artifacts it had written and writes no `run_summary.json` |
+| 130 | `INTERRUPTED` | the user interrupted the command (Ctrl-C); a run keeps the per-scenario artifacts it had written and writes no `run_summary.json`; `plurai ci run` and `plurai ci token` exit 20 and 1 instead |
 
 The names are constants in `plurai.exit_codes`. A run that completed with failing policies exits 1 unless something more
 specific applies; a run summary's `exit_code` field carries the same number.
@@ -325,6 +335,10 @@ credit refusals fails on a job that ends `terminal_reason: credit` instead of re
 | `plurai backend identity`, `plurai backend probe` | ask which deployment answers, or whether it answers |
 | `plurai fetch policies`, `plurai fetch artifact` | download backend-owned files |
 | `plurai correct-scores` | overwrite corrected scores on your observability platform |
+| `plurai ci run` | run the committed suite in CI and write its reports into `PLURAI_CI_OUT_DIR`; run from the simulation directory. Exit 0 (every counted scenario × policy held), 1 (one failed), 10 (the backend refuses this SDK version, with the same text as every other command in the job summary and `run.json`), 20 (not measured), 65 (refused) or 77 (token rejected or refused) |
+| `plurai ci validate [--online]` | check `ci.yaml` and the committed ids, and with `--online` the backend's view of them; run from the simulation directory. Exit 0 (valid; it never exits 1, because it runs no policy), 10, 20 (no token or an unreachable backend), 65 or 77 |
+| `plurai ci token --github OWNER/REPO [--expires-in DAYS]` | mint a service-account key named `OWNER/REPO` (365 days by default) with the key `plurai login` saved, and write it to the repository secret `PLURAI_TOKEN` through `gh secret set` on stdin; the key is never printed, and it has full access to your Plurai organization. Refuses with exit 65 before minting anything without a saved login, with `PLURAI_TOKEN` set, or with `gh` missing or not logged in; a failed `gh secret set` revokes the new key again. Other exits: 77 (the saved login is not accepted), 10, 75 (try again later), 69 (the backend could not be reached), 17 (the backend refused the request); Ctrl-C exits 1 |
+| `plurai suite diff [--base REF]` | print what changed in the suite's committed ids since a git ref, with the backend's content. Exit 0, 10, 65 (no base, or the base cannot be read) or 77 (no usable credential) |
 | `plurai-scan-contract check`, `recheck` | verify a corpus against the facts the agent's description claims, on your machine |
 
 Run any command with `--help` for its flags. A command writes only what a caller parses to stdout and everything else to

@@ -88,6 +88,67 @@ class AgentAction(BaseModel):
     status: Annotated[str | None, Field(title='Status')] = None
 
 
+class ArtifactDocument(BaseModel):
+    """
+    One source document of a corpus, as ``GET /artifacts/{id}`` lists it: ``name`` is the document's
+    name relative to the directory all the corpus's documents share (a source may name its documents
+    by absolute path), and ``sha256`` the hex digest of its chunk texts. The digest covers each chunk's
+    text in chunk order, each followed by a NUL byte, so two corpora that hold the same chunks of a
+    document give the same digest, and a document cut differently reads as changed. Adding a document
+    in a new top-level directory can move the shared root and so change every name. No text is served.
+    A client compares two listings by ``name``: a name in only one is added or removed, a name in both
+    with different digests is changed.
+    """
+
+    model_config = ConfigDict(
+        extra='ignore',
+    )
+    name: Annotated[str, Field(title='Name')]
+    sha256: Annotated[str, Field(title='Sha256')]
+
+
+class ArtifactLink(BaseModel):
+    """
+    One link of an artifact to the artifact it was built from: ``kind`` is the target's Job kind
+    (``scenarios``, ``evals``, ``env`` or ``corpus``), ``id`` its id and ``role`` what it is to this
+    artifact (``scenario_set``, ``env`` or ``corpus``). Links point downstream to upstream.
+    """
+
+    model_config = ConfigDict(
+        extra='ignore',
+    )
+    id: Annotated[str, Field(title='Id')]
+    kind: Annotated[str, Field(title='Kind')]
+    role: Annotated[str, Field(title='Role')]
+
+
+class ArtifactPolicyTier(BaseModel):
+    """
+    One policy of an eval set and the tier a confident violation of it is scored at: the
+    declared ``verdict_tier`` where there is one, else the tier the backend derives (an integrity
+    floor, ``terminate_values``, is ``catastrophic``). A client never derives a tier itself.
+    """
+
+    model_config = ConfigDict(
+        extra='ignore',
+    )
+    effective_tier: Annotated[Literal['catastrophic', 'failing', 'standard'], Field(title='Effective Tier')]
+    name: Annotated[str, Field(title='Name')]
+
+
+class ArtifactScenarioSolvability(BaseModel):
+    """
+    One scenario of a scenario set and the state ``POST /threads`` acts on. ``unsolvable``
+    scenarios are refused with ``scenario_quarantined_unsolvable:``; ``untested`` is admitted.
+    """
+
+    model_config = ConfigDict(
+        extra='ignore',
+    )
+    name: Annotated[str, Field(title='Name')]
+    solvability: Annotated[Literal['solvable', 'unsolvable', 'untested'], Field(title='Solvability')]
+
+
 class BackendStamp(BaseModel):
     """
     WHICH BACKEND produced these verdicts — stamped onto every ``/finalize`` response.
@@ -112,6 +173,28 @@ class BackendStamp(BaseModel):
     started_at: Annotated[float, Field(title='Started At')]
 
 
+class ClientUpgradeRequiredResponse(BaseModel):
+    """
+    The 426 body on every route when the ``X-Plurai-Client`` header is missing, malformed, from an unknown client, or below
+    that client's floor. ``reason`` says which; ``minimum_versions`` is every client's floor, and the same floors ride the
+    ``X-Plurai-Min-Client`` response header.
+    """
+
+    model_config = ConfigDict(
+        extra='ignore',
+    )
+    client: Annotated[str | None, Field(title='Client')] = None
+    client_version: Annotated[str | None, Field(title='Client Version')] = None
+    error: Annotated[Literal['client_upgrade_required'], Field(title='Error')]
+    message: Annotated[str, Field(title='Message')]
+    minimum_version: Annotated[str | None, Field(title='Minimum Version')] = None
+    minimum_versions: Annotated[dict[str, str] | None, Field(title='Minimum Versions')] = None
+    reason: Annotated[
+        Literal['missing_header', 'malformed_header', 'unknown_client', 'below_floor'],
+        Field(title='Reason'),
+    ]
+
+
 class CreateThreadRequest(BaseModel):
     """
     Inputs the client provides to spin up a fresh simulation thread.
@@ -133,6 +216,12 @@ class CreateThreadRequest(BaseModel):
     opener is published. A one-shot pipeline has no turn, so its documents stay the hop's
     inputs in ``initial_agent_context``. Absent: the opener's documents ride the opener when
     there is one, and stay in ``initial_agent_context`` when there is none.
+
+    ``env_id`` names the env the run talks to. The server renders the answerability fence the
+    judges grade under from the eval set's recorded authored surface; the env's declared tool surface is the fallback for a set recorded
+    without one. Absent, the id is read off
+    ``mock_service_url`` when that is the server's own ``/mock/<env_id>/`` path; a run with
+    neither grades unfenced.
     """
 
     model_config = ConfigDict(
@@ -141,6 +230,7 @@ class CreateThreadRequest(BaseModel):
     agent_name: Annotated[str | None, Field(title='Agent Name')] = 'plurai-agent'
     agent_opens: Annotated[bool | None, Field(title='Agent Opens')] = False
     agent_version: Annotated[str, Field(min_length=1, title='Agent Version')]
+    env_id: Annotated[str | None, Field(title='Env Id')] = None
     eval_set_id: Annotated[str | None, Field(title='Eval Set Id')] = None
     experiment_name: Annotated[str | None, Field(title='Experiment Name')] = None
     max_turns: Annotated[int | None, Field(ge=1, title='Max Turns')] = 5
@@ -153,7 +243,8 @@ class CreateThreadRequest(BaseModel):
 class CreditRefusal(BaseModel):
     """
     A credit refusal: the whole body of the HTTP 402 that ``POST /threads`` and ``POST /threads/{id}/user-turn``
-    answer, and the ``credit`` block of a failed finalize or rescore job's ``error``, in the shape of the ``capacity`` block.
+    answer, the ``credit`` block of a failed finalize or rescore job's ``error``, and the ``credit_refusal`` of a thread
+    that ended on one, in the shape of the ``capacity`` block.
 
     The LLM gateway refused a model call because the organization's credit standing does not
     allow it. ``code`` is the kind: ``insufficient-credit`` (no credit left), ``new-run-refused``
@@ -224,11 +315,18 @@ class FailRequest(BaseModel):
 
 
 class FailResponse(BaseModel):
+    """
+    Acknowledges a failure report. ``status`` is always ``failed``, even when the thread keeps the status it already ended with:
+    it acknowledges the report. ``thread_status`` is the status the thread has after the report (``failed``, or ``completed`` for
+    a run whose result landed first), so a client can tell a failure it caused from one it reported too late.
+    """
+
     model_config = ConfigDict(
         extra='ignore',
     )
     status: Annotated[Literal['failed'], Field(title='Status')]
     thread_id: Annotated[str, Field(title='Thread Id')]
+    thread_status: Annotated[Literal['active', 'completed', 'failed'] | None, Field(title='Thread Status')] = None
 
 
 class FinalizeJobCancelResponse(BaseModel):
@@ -305,6 +403,58 @@ class InlineRowRef(BaseModel):
     key: Annotated[str, Field(title='Key')]
     key_field: Annotated[str, Field(title='Key Field')]
     list_field: Annotated[str, Field(title='List Field')]
+
+
+class MockPathRefusedResponse(BaseModel):
+    """
+    The body of a ``/mock/<env_id>`` call whose PATH the proxy refuses, answered 400 with ``code='mock_path_refused'``. It is
+    never a 404: the refusal is the proxy's, not the service's, so an agent can tell it from the mock's own "no such route".
+    Only a path the proxy and the mock could read two ways is refused (a ``.`` / ``..`` segment, a control character, a
+    separator or delimiter such as a backslash, ``?``, ``#`` or ``;``, a surviving ``%``, or a route only the box calls); a name
+    with a space, an apostrophe, parentheses or a non-ASCII letter is forwarded. ``reason`` is the class: ``dot_segment``,
+    ``control_character``, ``reserved_character``, ``percent`` or ``internal_route``.
+    """
+
+    model_config = ConfigDict(
+        extra='ignore',
+    )
+    code: Annotated[Literal['mock_path_refused'], Field(title='Code')]
+    env_id: Annotated[str, Field(title='Env Id')]
+    error: Annotated[str, Field(title='Error')]
+    reason: Annotated[
+        Literal[
+            'dot_segment',
+            'control_character',
+            'reserved_character',
+            'percent',
+            'internal_route',
+        ],
+        Field(title='Reason'),
+    ]
+
+
+class MockUnavailableResponse(BaseModel):
+    """
+    The body of a ``/mock/<env_id>`` call the proxy cannot serve, answered 410 or 503. A client branches on ``code``, never on
+    the prose: ``restarting`` (503) heals in seconds, so retry; ``awaiting_edit_finalize`` (503) waits on an edit session;
+    ``needs_redeploy`` (410) needs the env deployed again; ``unknown_env`` (410) names an id this backend does not hold, so only
+    the right id or a new generation helps. ``restart_count`` and ``last_deploy_error`` are the env's own record of its
+    automatic redeploys. ``edit_session_started_at`` (UTC, ISO 8601) is set on ``awaiting_edit_finalize`` when a live edit
+    session holds the env: the time that session was opened.
+    """
+
+    model_config = ConfigDict(
+        extra='ignore',
+    )
+    code: Annotated[
+        Literal['restarting', 'awaiting_edit_finalize', 'needs_redeploy', 'unknown_env'],
+        Field(title='Code'),
+    ]
+    edit_session_started_at: Annotated[str | None, Field(title='Edit Session Started At')] = None
+    env_id: Annotated[str, Field(title='Env Id')]
+    error: Annotated[str, Field(title='Error')]
+    last_deploy_error: Annotated[str | None, Field(title='Last Deploy Error')] = None
+    restart_count: Annotated[int | None, Field(title='Restart Count')] = None
 
 
 class Overrule(BaseModel):
@@ -688,6 +838,74 @@ class WorldDelta(BaseModel):
     upserted: Annotated[dict[str, dict[str, Any]] | None, Field(title='Upserted')] = None
 
 
+class ArtifactReadDetail(BaseModel):
+    """
+    The part of an artifact's ``detail`` the CI check reads. The artifact's kind-specific detail
+    rides beside these keys and is not part of the contract.
+
+    ``links`` and ``lineage`` are on every suite artifact: ``lineage`` is the id the
+    artifact was copied from at a copy-on-write release, ``null`` when none is recorded; follow it from
+    read to read for the chain of ancestors. ``pinned_digest`` covers
+    the links; ``pinned_digest_drift`` is true when the content on the backend hashes to something
+    else. ``ingestion_posture`` and a per-scenario ``scenarios`` list are on a scenario set;
+    ``ingestion_posture`` is ``null`` when the set was generated ungrounded or its ledger version
+    is not held. ``policy_tiers`` is on an eval set, ``null`` when its policies cannot be loaded.
+    ``documents`` is on a published corpus: its source documents sorted by name, ``[]`` when it holds
+    none and ``null`` when its graph cannot be read or its content has drifted from the published digest;
+    absent on every other kind and while the corpus is still being built.
+    """
+
+    model_config = ConfigDict(
+        extra='ignore',
+    )
+    documents: Annotated[list[ArtifactDocument] | None, Field(title='Documents')] = None
+    ingestion_posture: Annotated[Literal['anonymized', 'raw'] | None, Field(title='Ingestion Posture')] = None
+    lineage: Annotated[str | None, Field(title='Lineage')] = None
+    links: Annotated[list[ArtifactLink] | None, Field(title='Links')] = None
+    pinned_digest: Annotated[str | None, Field(title='Pinned Digest')] = None
+    pinned_digest_drift: Annotated[bool | None, Field(title='Pinned Digest Drift')] = None
+    policy_tiers: Annotated[list[ArtifactPolicyTier] | None, Field(title='Policy Tiers')] = None
+    scenarios: Annotated[list[ArtifactScenarioSolvability] | None, Field(title='Scenarios')] = None
+
+
+class ArtifactReadResponse(BaseModel):
+    """
+    The Job envelope served by ``GET /artifacts/{artifact_id}`` — the byte-lane twin of the MCP
+    ``get_artifact_meta`` tool. ``detail`` carries the
+    links, lineage, pinned digest, ingestion posture, per-scenario solvability and per-policy
+    effective tiers the CI existence and coherence check reads. An id that resolves to nothing
+    is served as this same envelope with ``kind='unknown'`` and HTTP 404. ``status`` says whether the
+    artifact is published: links, posture and tiers are served for a running, failed or cancelled job
+    too, so a check that needs published content requires ``status == 'done'``. Like
+    ``GET /jobs/{job_id}``, the body is customer-safe: ``error`` is a scrubbed diagnosis and ``error_id``
+    is the id to quote.
+    """
+
+    model_config = ConfigDict(
+        extra='ignore',
+    )
+    capacity: Annotated[dict[str, str] | None, Field(title='Capacity')] = None
+    command_run_id: Annotated[str | None, Field(title='Command Run Id')] = None
+    completed_at: Annotated[float | None, Field(title='Completed At')] = None
+    credit: CreditRefusal | None = None
+    detail: ArtifactReadDetail | None = None
+    elapsed_seconds: Annotated[float | None, Field(title='Elapsed Seconds')] = None
+    error: Annotated[str | None, Field(title='Error')] = None
+    error_id: Annotated[str | None, Field(title='Error Id')] = None
+    id: Annotated[str, Field(title='Id')]
+    kind: Annotated[str, Field(title='Kind')]
+    phase: Annotated[str | None, Field(title='Phase')] = None
+    progress_kind: Annotated[
+        Literal['stream', 'tool_execution', 'subprocess'] | None,
+        Field(title='Progress Kind'),
+    ] = None
+    seconds_since_progress: Annotated[float | None, Field(title='Seconds Since Progress')] = None
+    started_at: Annotated[float, Field(title='Started At')]
+    status: Annotated[str, Field(title='Status')]
+    terminal_reason: Annotated[TerminalReason | None, Field(title='Terminal Reason')] = None
+    unavailable: Annotated[dict[str, str] | None, Field(title='Unavailable')] = None
+
+
 class CreateThreadResponse(BaseModel):
     """
     Everything the client needs to start the loop after a thread is created.
@@ -906,7 +1124,9 @@ class GetThreadResponse(BaseModel):
     )
     chatbot_messages: Annotated[list[SerializedMessage] | None, Field(title='Chatbot Messages')] = None
     created_at: Annotated[str, Field(title='Created At')]
+    credit_refusal: CreditRefusal | None = None
     policy_evaluation_results: Annotated[dict[str, Any] | None, Field(title='Policy Evaluation Results')] = None
+    run_origin: Annotated[str | None, Field(title='Run Origin')] = None
     scenario_metadata: Annotated[dict[str, Any] | None, Field(title='Scenario Metadata')] = None
     status: Annotated[Literal['active', 'completed', 'failed'], Field(title='Status')]
     thread_id: Annotated[str, Field(title='Thread Id')]

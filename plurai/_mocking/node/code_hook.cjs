@@ -681,6 +681,10 @@ function mockExecuteRequest(tool, args, sid, mockUrl) {
   // The wire request for one tool call: the url, the JSON body and the headers.
   const body = JSON.stringify({ session_id: sid, tool, args, turn: currentTurn() });
   const headers = { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body), [CLIENT_HEADER]: CLIENT_HEADER_VALUE };
+  // A CI run labels itself on every request; the only value the backend accepts is `ci`.
+  if (process.env.PLURAI_RUN_ORIGIN === 'ci') {
+    headers['X-Plurai-Run-Origin'] = 'ci';
+  }
   const url = mockExecuteUrl(mockUrl);
   const token = bearerFor(url.href);
   if (token) {

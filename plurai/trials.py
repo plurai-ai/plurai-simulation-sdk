@@ -750,11 +750,15 @@ def cells_from_run_dir(run_dir: Path) -> dict[str, ScenarioCells]:
 def cells_from_summary(run_dir: Path, summary: Any) -> dict[str, ScenarioCells]:
     """:func:`cells_from_run_dir` over a summary already in hand — the dict the single-run writer is
     about to write, so the population is the one that file will name. Only ``scenarios``,
-    ``scenario_verdicts``, ``replay_mode`` and ``single_hop_scenarios`` are read off it; every cell comes from ``run_dir``'s scenario folders.
+    ``scenario_verdicts``, ``not_run_scenarios``, ``replay_mode`` and ``single_hop_scenarios`` are read off it; every cell comes
+    from ``run_dir``'s scenario folders.
     ``{}`` when ``summary`` lists no scenarios."""
     if not isinstance(summary, dict) or not isinstance(summary.get('scenarios'), dict):
         return {}
     verdicts: dict[str, Any] = raw if isinstance(raw := summary.get('scenario_verdicts'), dict) else {}
+    # The scenarios an abort of the run (credit refused, mock unanswered) kept from finishing: ``incomplete`` rows that are not the
+    # suite's quarantines.
+    stopped = set(listed) if isinstance(listed := summary.get('not_run_scenarios'), list) else set()
     cells: dict[str, ScenarioCells] = {}
     raised: dict[str, Any] = {}
     goal_sources: set[str | None] = set()
@@ -780,7 +784,9 @@ def cells_from_summary(run_dir: Path, summary: Any) -> dict[str, ScenarioCells]:
             continue
         refusals = _tool_refusals(run_dir / sid)
         if judged is None or status.get('value') == 'harness_error':
-            unmeasured: InvalidReason = 'harness_fault' if verdicts.get(sid) == 'not_valid' else 'quarantined' if row == 'incomplete' else 'errored'
+            unmeasured: InvalidReason = (
+                'harness_fault' if verdicts.get(sid) == 'not_valid' else 'not_run' if sid in stopped else 'quarantined' if row == 'incomplete' else 'errored'
+            )
             cells[sid] = ScenarioCells(
                 invalid_reason=unmeasured,
                 thread_id=None,

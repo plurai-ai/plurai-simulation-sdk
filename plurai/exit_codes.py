@@ -9,6 +9,15 @@ them:
 * 2 is never returned. It is the status ``argparse`` uses for a bad command line, and every parser here exits
   with :data:`USAGE` instead, so a 2 can only come from outside the SDK.
 
+Three exits of the CI commands (``plurai ci`` and ``plurai suite``) are the exceptions to the table. The first two keep a
+CI step on the one set of codes of ``plurai ci run``:
+
+* A bad command line is :data:`REFUSED`, not :data:`USAGE`.
+* Ctrl-C ends ``plurai ci run`` with :data:`NOT_MEASURED` after it cancels the open threads and writes the partial reports,
+  never :data:`INTERRUPTED`.
+* Ctrl-C ends ``plurai ci token`` with :data:`POLICIES_FAILED` after it revokes a key it made. The command checks no
+  policy, so the status says only that it did not finish.
+
 The numbers below 64 are specific to Plurai. 64 and above follow the BSD ``sysexits`` convention for the rows
 that have a counterpart there.
 
@@ -32,7 +41,8 @@ OK: Final = 0
 #: finding about the agent, not a fault of the run.
 POLICIES_FAILED: Final = 1
 
-#: A bad command line: an unknown flag, a missing argument, a value out of range.
+#: A bad command line: an unknown flag, a missing argument, a value out of range. ``plurai ci`` and ``plurai suite`` exit
+#: :data:`REFUSED` for it instead.
 USAGE: Final = 64
 
 #: The command declined to proceed on what it checked first: a gate finding holds the run, the target or input is
@@ -97,14 +107,15 @@ SCAN_HELD: Final = 18
 NOT_MEASURED: Final = 20
 
 #: The user interrupted the command (Ctrl-C): 128 plus SIGINT, the status a shell reports for it. What the command had
-#: finished stays on disk; nothing was concluded.
+#: finished stays on disk; nothing was concluded. ``plurai ci run`` and ``plurai ci token`` end a Ctrl-C with their own
+#: codes (see the module docstring).
 INTERRUPTED: Final = 130
 
 #: Name -> (code, one-line meaning), in the order the README prints them.
 TABLE: Final[dict[str, tuple[int, str]]] = {
     'OK': (OK, 'done; everything checked held'),
     'POLICIES_FAILED': (POLICIES_FAILED, 'the run completed and at least one scenario failed a policy'),
-    'USAGE': (USAGE, 'bad command line'),
+    'USAGE': (USAGE, 'bad command line (65 for plurai ci and plurai suite)'),
     'REFUSED': (REFUSED, 'declined to proceed: a gate holds the run, or the input or platform is unusable'),
     'INPUT_UNREADABLE': (INPUT_UNREADABLE, 'a local input file is missing, empty or unreadable'),
     'TRANSPORT': (TRANSPORT, 'the backend or the mock was unreachable or gave an unusable answer'),
@@ -121,7 +132,7 @@ TABLE: Final[dict[str, tuple[int, str]]] = {
     'BACKEND_REFUSED': (BACKEND_REFUSED, 'the backend refused what was sent'),
     'REQUIREMENT_GAP': (REQUIREMENT_GAP, 'the host toolchain check measured a gap'),
     'SCAN_HELD': (SCAN_HELD, 'the scan verified the sources and a finding holds the flow'),
-    'NOT_MEASURED': (NOT_MEASURED, 'the run could not measure what it checks: infra, suite or credits'),
+    'NOT_MEASURED': (NOT_MEASURED, 'the run could not measure what it checks: infra, agent, suite or credits'),
     'INTERRUPTED': (INTERRUPTED, 'interrupted by the user (Ctrl-C)'),
 }
 

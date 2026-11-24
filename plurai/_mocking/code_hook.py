@@ -278,8 +278,7 @@ def _load_surface_document(code_surface_path: str) -> _SurfaceDocument:
     # Lock-step with the Node loader, which raises on the same absent-version case.
     if 'version' not in raw or raw['version'] is None:
         raise CodeSurfaceError(
-            f'{code_surface_path}: surface is missing a `version`. A projector-stamped surface always '
-            'declares one; refusing to guess at an unstamped schema.'
+            f'{code_surface_path}: surface is missing a `version`. A projector-stamped surface always declares one; refusing to guess at an unstamped schema.'
         )
     version = raw['version']
     if version not in _SUPPORTED_SURFACE_VERSIONS:
@@ -324,9 +323,7 @@ def _parse_modules(raw_modules: Any, code_surface_path: str) -> dict[str, _Modul
             tool = method_spec.get('tool')
             disc_raw = method_spec.get('discriminator')
             if (tool is None) == (disc_raw is None):
-                raise CodeSurfaceError(
-                    f'{code_surface_path}: method {where} must set exactly one of `tool` (single-valued) or `discriminator` (multivalued).'
-                )
+                raise CodeSurfaceError(f'{code_surface_path}: method {where} must set exactly one of `tool` (single-valued) or `discriminator` (multivalued).')
             if tool is not None:
                 tool = _require_nonempty_str(tool, f'method {where} `tool`', code_surface_path)
             discriminator: _Discriminator | None = None
@@ -374,26 +371,18 @@ def _parse_cli_http(raw_cli_http: Any, code_surface_path: str) -> _CliHttpSurfac
 
     runtime = _require_nonempty_str(raw_cli_http.get('runtime'), '`cli_http.runtime`', code_surface_path)
     if runtime != _CLI_HTTP_RUNTIME:
-        raise CodeSurfaceError(
-            f'{code_surface_path}: `cli_http.runtime` must be {_CLI_HTTP_RUNTIME!r} (got {runtime!r}).'
-        )
+        raise CodeSurfaceError(f'{code_surface_path}: `cli_http.runtime` must be {_CLI_HTTP_RUNTIME!r} (got {runtime!r}).')
     preload = _require_nonempty_str(raw_cli_http.get('preload'), '`cli_http.preload`', code_surface_path)
     return_envelope = _require_nonempty_str(raw_cli_http.get('return_envelope'), '`cli_http.return_envelope`', code_surface_path)
     if return_envelope != _CLI_HTTP_RETURN_ENVELOPE:
-        raise CodeSurfaceError(
-            f'{code_surface_path}: `cli_http.return_envelope` must be {_CLI_HTTP_RETURN_ENVELOPE!r} (got {return_envelope!r}).'
-        )
+        raise CodeSurfaceError(f'{code_surface_path}: `cli_http.return_envelope` must be {_CLI_HTTP_RETURN_ENVELOPE!r} (got {return_envelope!r}).')
     unmapped_egress = _require_nonempty_str(raw_cli_http.get('unmapped_egress'), '`cli_http.unmapped_egress`', code_surface_path)
     if unmapped_egress != _CLI_HTTP_UNMAPPED_EGRESS:
-        raise CodeSurfaceError(
-            f'{code_surface_path}: `cli_http.unmapped_egress` must be {_CLI_HTTP_UNMAPPED_EGRESS!r} (got {unmapped_egress!r}).'
-        )
+        raise CodeSurfaceError(f'{code_surface_path}: `cli_http.unmapped_egress` must be {_CLI_HTTP_UNMAPPED_EGRESS!r} (got {unmapped_egress!r}).')
 
     raw_subcommands = raw_cli_http.get('subcommands')
     if not isinstance(raw_subcommands, dict) or not raw_subcommands:
-        raise CodeSurfaceError(
-            f'{code_surface_path}: `cli_http.subcommands` must be a non-empty mapping of subcommand -> {{tool, egress_guard}}.'
-        )
+        raise CodeSurfaceError(f'{code_surface_path}: `cli_http.subcommands` must be a non-empty mapping of subcommand -> {{tool, egress_guard}}.')
     subcommands: dict[str, _CliSubcommand] = {}
     for name, spec in raw_subcommands.items():
         where = f'cli_http.subcommands.{name}'

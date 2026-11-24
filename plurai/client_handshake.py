@@ -88,6 +88,25 @@ class UpgradeRefusal:
     #: The lowest SDK version the backend serves, or ``None`` when the answer did not carry a usable one.
     floor: str | None
 
+    def record(self) -> dict[str, str | None]:
+        """The refusal as a JSON block for a run's records: the refusal, the client it refused and the floor."""
+        return {
+            'error': REFUSAL_ERROR,
+            'reason': self.reason,
+            'client': CLIENT_NAME,
+            'client_version': version(),
+            'floor': self.floor,
+        }
+
+    @classmethod
+    def from_record(cls, record: object) -> UpgradeRefusal:
+        """The refusal a :meth:`record` block holds. A field outside the closed vocabulary or the version grammar reads as
+        ``None``."""
+        fields = record if isinstance(record, dict) else {}
+        reason = fields.get('reason')
+        known = reason if isinstance(reason, str) and reason in REASONS else None
+        return cls(reason=known, floor=_as_version(fields.get('floor')))
+
 
 class _Response(Protocol):
     status_code: int

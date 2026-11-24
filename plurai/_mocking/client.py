@@ -25,7 +25,7 @@ import urllib.request
 from collections.abc import Callable
 from typing import Any, Literal
 
-from plurai import client_handshake
+from plurai import client_handshake, run_origin
 from plurai._endpoints import bearer_for, is_loopback_url
 from plurai._http_retry import (
     BACKOFF_BASE_SECONDS,
@@ -380,6 +380,8 @@ class _KeepAliveOpener:
     def urlopen(self, req: urllib.request.Request, timeout: float) -> _Reply:
         # Stamped here, before the route splits, so the pooled path and the proxied ``urllib`` path both carry it.
         req.add_unredirected_header(client_handshake.HEADER, client_handshake.header_value())
+        if (origin := run_origin.current()) is not None:
+            req.add_unredirected_header(run_origin.HEADER, origin)
         # Some HTTP front ends refuse urllib's default ``Python-urllib/*`` agent, so every request names the SDK as its agent,
         # as :mod:`plurai._http` does. Do not remove it.
         if not req.has_header(client_handshake.USER_AGENT_HEADER.capitalize()):  # ``Request`` keeps header names capitalized

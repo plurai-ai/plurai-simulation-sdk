@@ -64,7 +64,8 @@ from plurai import client_handshake, exit_codes
 from plurai._http_retry import RATE_LIMITED_STATUS
 from plurai.customer_safe import describe_failure, response_json, safe_text
 from plurai.ingest._command import client as authed_client
-from plurai.ingest._command import TRANSIENT_STATUS_CODES, CommandError, credit_stop, prefixed_warnings, send_with_retry, write_atomic
+from plurai.atomic_write import write_atomic
+from plurai.ingest._command import TRANSIENT_STATUS_CODES, CommandError, credit_stop, prefixed_warnings, send_with_retry
 from plurai.ingest.storage_client import (
     MAX_OBJECT_NAME_LENGTH,
     PartUploadUnsupportedError,

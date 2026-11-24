@@ -18,6 +18,7 @@ import os
 import re
 import signal
 import sys
+import weakref
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, replace
@@ -105,6 +106,19 @@ class _DecodeFailure:
 
 
 logger = logging.getLogger(__name__)
+
+#: The agent children this process spawned, for a caller that has to stop them while the event loop is not running (a signal
+#: handler). A child that was reaped has a return code and is skipped.
+_SPAWNED: weakref.WeakSet[asyncio.subprocess.Process] = weakref.WeakSet()
+
+
+def live_child_pids() -> list[int]:
+    """The process ids of the agent children that have not exited. Safe to call from any thread."""
+    while True:
+        try:
+            return [proc.pid for proc in list(_SPAWNED) if proc.returncode is None]
+        except RuntimeError:  # the set changed under the copy: another thread spawned or dropped a child
+            continue
 
 
 #: ``_thread_id`` before ``init()`` names the real thread. Only ever rendered into an
@@ -287,6 +301,7 @@ class ChildProcess:
             limit=IPC_LINE_LIMIT_BYTES,
             start_new_session=_OWN_PROCESS_GROUP,
         )
+        _SPAWNED.add(self._proc)
         if _OWN_PROCESS_GROUP:
             self._pgid = self._proc.pid
         self._stdout_task = asyncio.create_task(self._read_stdout(), name='plurai-child-stdout')

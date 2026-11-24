@@ -202,8 +202,7 @@ def home_problem(env: Mapping[str, str] | None = None, *, is_win: bool | None = 
     except OSError:
         pass
     return (
-        f'HOME is {named}, not the account home {actual}, so the saved credential is not looked for there; '
-        'run this with your own HOME, or export PLURAI_URL and PLURAI_TOKEN'
+        f'HOME is {named}, not the account home {actual}, so the saved credential is not looked for there; run this with your own HOME, or export PLURAI_TOKEN'
     )
 
 

@@ -32,6 +32,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
+from plurai import run_origin
 from plurai._endpoints import TOKEN_ENV, URL_ENV
 from plurai.host_effects import BACKEND_TOKEN_ENV, CLI_CREDENTIAL_ENV, CLI_SECRET_ENV
 from plurai.ingest.workspace_config import CONFIG_FILENAME, WorkspaceConfigError, bench_config_roots, discover_config_documents
@@ -122,6 +123,93 @@ _CREDENTIAL_SEGMENT = re.compile(r'(?:^|_)(?:TOKENS?|KEYS?|SECRETS?|PASSWORDS?|C
 
 _VARIABLE_NAME = re.compile(r'[A-Za-z_][A-Za-z0-9_]*')
 
+_GITHUB_COMMAND_FILE = "a GitHub Actions workflow-command file: what the agent writes there changes the job's later steps"
+_GITLAB_JOB_JWT = "GitLab's signed job identity token"
+
+#: The names a CI run refuses in ``agent.env``, each with why. A repo declares ``agent.env`` and a pull request can change it,
+#: so these are the names that would hand the agent a CI credential, a token endpoint, or a file that steers the job. Each is
+#: listed by exact name: a platform's other variables (``CI_ENVIRONMENT``, ``GITHUB_REPOSITORY``, ``RUNNER_TEMP``) carry no
+#: credential and are an app's to pass on, unless they read as a credential (:data:`_CI_PLATFORM_PREFIXES`). Matching ignores
+#: case. The rule reads names, never values.
+RESERVED_AGENT_ENV: Mapping[str, str] = {
+    'GITHUB_TOKEN': "the GitHub Actions job's repository token",
+    'GH_TOKEN': 'the GitHub CLI token',
+    'GH_ENTERPRISE_TOKEN': 'the GitHub CLI token for a GitHub Enterprise host',
+    'GITHUB_ENTERPRISE_TOKEN': 'the GitHub CLI token for a GitHub Enterprise host',
+    'ACTIONS_ID_TOKEN_REQUEST_TOKEN': 'the GitHub Actions credential that mints OIDC tokens for cloud sign-in',
+    'ACTIONS_ID_TOKEN_REQUEST_URL': 'the GitHub Actions endpoint that mints OIDC tokens for cloud sign-in',
+    'ACTIONS_RUNTIME_TOKEN': "the GitHub Actions runner's own token",
+    'ACTIONS_RUNTIME_URL': "a GitHub Actions runner service endpoint, used with the runner's own token",
+    'ACTIONS_RESULTS_URL': "a GitHub Actions runner service endpoint, used with the runner's own token",
+    'ACTIONS_CACHE_URL': "a GitHub Actions runner service endpoint, used with the runner's own token",
+    'GITHUB_ENV': _GITHUB_COMMAND_FILE,
+    'GITHUB_PATH': _GITHUB_COMMAND_FILE,
+    'GITHUB_OUTPUT': _GITHUB_COMMAND_FILE,
+    'GITHUB_STATE': _GITHUB_COMMAND_FILE,
+    'GITHUB_STEP_SUMMARY': _GITHUB_COMMAND_FILE,
+    'CI_JOB_TOKEN': "GitLab's job token",
+    'CI_BUILD_TOKEN': "GitLab's job token, under its older name",
+    'CI_JOB_JWT': _GITLAB_JOB_JWT,
+    'CI_JOB_JWT_V1': _GITLAB_JOB_JWT,
+    'CI_JOB_JWT_V2': _GITLAB_JOB_JWT,
+    'CI_REPOSITORY_URL': "GitLab's clone URL, which carries the job token",
+    'CI_REGISTRY_PASSWORD': "GitLab's container registry password",
+    'CI_DEPLOY_PASSWORD': "GitLab's deploy token",
+    'CI_DEPENDENCY_PROXY_PASSWORD': "GitLab's dependency proxy password",
+    'SYSTEM_ACCESSTOKEN': "Azure Pipelines' job token",
+    'BUILDKITE_AGENT_ACCESS_TOKEN': "Buildkite's job token",
+    'BUILDKITE_AGENT_TOKEN': "Buildkite's agent registration token",
+    'CIRCLE_OIDC_TOKEN': "CircleCI's OIDC token",
+    'CIRCLE_OIDC_TOKEN_V2': "CircleCI's OIDC token",
+    'BITBUCKET_STEP_OIDC_TOKEN': "Bitbucket Pipelines' OIDC token",
+    'BUILDKITE_AGENT_JOB_API_SOCKET': "Buildkite's job API socket, which changes the job's environment",
+}
+
+#: The prefixes of the CI platforms' own variables. Under them a name that reads as a credential is reserved too, so a token a
+#: platform adds later, or one this list misses, is refused rather than passed on.
+_CI_PLATFORM_PREFIXES: tuple[str, ...] = (
+    'GITHUB_',
+    'GH_',
+    'ACTIONS_',
+    'RUNNER_',
+    'CI_',
+    'BUILDKITE_',
+    'CIRCLE_',
+    'BITBUCKET_',
+    'TRAVIS_',
+    'JENKINS_',
+    'SYSTEM_',
+)
+
+#: A name segment that marks a CI credential: the :data:`_CREDENTIAL_SEGMENT` words and the token kinds CI platforms name.
+_CI_CREDENTIAL_SEGMENT = re.compile(r'(?:^|_)(?:TOKENS?|KEYS?|SECRETS?|PASSWORDS?|CREDENTIALS?|JWT|ACCESSTOKEN|OIDC)(?:_|$)')
+
+_CI_CREDENTIAL_REASON = 'a name under a CI platform prefix that reads as a credential'
+
+#: Plurai's own control: the backend pair, the run origin and the SDK's settings. The runner sets what the agent gets under it
+#: (the :data:`ALLOWLIST_PREFIXES` settings that do not read as a credential, and the resolved ``PLURAI_URL`` /
+#: ``PLURAI_TOKEN``), so a declaration cannot add to it.
+RESERVED_AGENT_ENV_PREFIX = 'PLURAI_'
+
+_PLURAI_REASON = 'a Plurai control variable; the runner sets the ones the agent gets'
+
+
+def reserved_agent_env_reason(name: str) -> str | None:
+    """Why a CI run refuses ``name`` as a declared ``agent.env`` name; ``None`` when it may be declared."""
+    upper = name.upper()
+    if upper.startswith(RESERVED_AGENT_ENV_PREFIX):
+        return _PLURAI_REASON
+    if (reason := RESERVED_AGENT_ENV.get(upper)) is not None:
+        return reason
+    if upper.startswith(_CI_PLATFORM_PREFIXES) and _CI_CREDENTIAL_SEGMENT.search(upper):
+        return _CI_CREDENTIAL_REASON
+    return None
+
+
+def reserved_agent_env_refusal(name: str, reason: str) -> str:
+    """The one sentence that refuses a reserved ``agent.env`` name, wherever the refusal is raised."""
+    return f'`agent.env` declares `{name}`, {reason}. Such names never reach the agent through `agent.env`'
+
 
 class AgentEnvConfigError(WorkspaceConfigError):
     """``agent.env`` exists but cannot testify to a list of variable names (fail closed)."""
@@ -193,6 +281,10 @@ def child_environment(
     backend the parent names. A blank value is no value.
     """
     names = set(declared)
+    if run_origin.current(parent) == run_origin.CI:
+        for name in sorted(names):
+            if (reason := reserved_agent_env_reason(name)) is not None:
+                raise AgentEnvConfigError(f'{reserved_agent_env_refusal(name, reason)}; remove it from agent.env.')
     env = {name: value for name, value in parent.items() if _inherited(name) or name in names}
     env.update(extra or {})
     resolved_url = url or parent.get(URL_ENV)
@@ -305,6 +397,8 @@ __all__ = [
     'MisplacedAgentKey',
     'child_environment',
     'declared_env',
+    'reserved_agent_env_reason',
+    'reserved_agent_env_refusal',
     'launch_environment',
     'misplaced_agent_keys',
     'parse_declared_env',

@@ -137,6 +137,14 @@ def _model_of(message: Any) -> str | None:
     return None
 
 
+def models_of(messages: Any) -> list[str]:
+    """The distinct model ids the assistant messages of a chain name, in first-seen order. Anything that is not a chain, and any
+    message that is not an assistant's, names nothing."""
+    if not isinstance(messages, list):
+        return []
+    return list(dict.fromkeys(m for message in messages if _role_of(message) == 'assistant' and (m := _model_of(message)) is not None))
+
+
 def _provider_of(message: Any) -> str | None:
     """The serving provider from ``response_metadata.model_provider``, ``None`` when unnamed."""
     value = _field(_field(message, 'response_metadata'), 'model_provider')
